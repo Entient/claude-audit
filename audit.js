@@ -1069,7 +1069,8 @@ function parseArgs() {
     else if (args[i] === "status")    { opts.command = "status";    }
     else if (args[i] === "doctor")    { opts.command = "doctor";    }
     else if (args[i] === "setup")     { opts.command = "setup";     }
-    else if (args[i] === "billing")   { opts.command = "billing";   }
+    else if (args[i] === "billing")    { opts.command = "billing";    }
+    else if (args[i] === "reconcile") { opts.command = "reconcile"; opts.reconcileFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "--hook" && args[i + 1]) { opts.hook = args[++i]; }
     else if ((args[i] === "--last" || args[i] === "-l") && args[i + 1]) opts.last = args[++i];
     else if (args[i].startsWith("--last=")) opts.last = args[i].slice(7);
@@ -1880,6 +1881,185 @@ function billingReport(windowStr = "30d") {
   console.log("");
 }
 
+// ── Reconcile command ────────────────────────────────────────────────────────
+// Reads claude-audit-billing.json (from Token Slasher export) and cross-references
+// with metering.db to explain every Anthropic email receipt.
+
+function reconcile(exportFile) {
+  const defaultFile = path.join(os.homedir(), "Downloads", "claude-audit-billing.json");
+  const filePath = exportFile || defaultFile;
+
+  // Load Token Slasher export
+  if (!fs.existsSync(filePath)) {
+    console.log("");
+    console.log(bold("  RECONCILE — No export file found"));
+    console.log(`  Expected: ${filePath}`);
+    console.log("");
+    console.log("  Steps to export from Token Slasher:");
+    console.log("  1. Open Chrome → click the Token Slasher extension icon");
+    console.log("  2. Click  Export to claude-audit");
+    console.log("  3. Save as  claude-audit-billing.json  in your Downloads folder");
+    console.log("  4. Run  node audit.js reconcile  again");
+    console.log("");
+    return;
+  }
+
+  let exportData;
+  try {
+    exportData = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (e) {
+    console.log(`  Error reading ${filePath}: ${e.message}`);
+    return;
+  }
+
+  const invoices   = (exportData.anthropic && exportData.anthropic.invoices)   || [];
+  const dailyUsage = (exportData.anthropic && exportData.anthropic.dailyUsage) || [];
+
+  // Load metering.db if available
+  let meteringRows = [];
+  let meteringAvail = false;
+  const meteringPath = path.join(os.homedir(), ".entient", "v2", "metering.db");
+  if (fs.existsSync(meteringPath)) {
+    try {
+      // Use sqlite3 via child_process if available
+      const { execSync } = require("child_process");
+      const query = `SELECT DATE(timestamp_utc) as d, model, SUM(total_tokens) as tok, SUM(cost_usd) as cost, COUNT(*) as calls FROM usage WHERE cached=0 GROUP BY DATE(timestamp_utc), model ORDER BY d DESC;`;
+      const out = execSync(`python3 -c "
+import sqlite3, json, sys
+conn = sqlite3.connect('${meteringPath.replace(/\\/g, "/")}')
+rows = conn.execute('''${query}''').fetchall()
+print(json.dumps([{'date':r[0],'model':r[1],'tokens':r[2],'cost':r[3],'calls':r[4]} for r in rows]))
+"`, { encoding: "utf8", timeout: 10000 });
+      meteringRows = JSON.parse(out.trim());
+      meteringAvail = true;
+    } catch (_) {
+      meteringAvail = false;
+    }
+  }
+
+  // Group metering rows by date
+  const meteringByDate = {};
+  for (const r of meteringRows) {
+    if (!meteringByDate[r.date]) meteringByDate[r.date] = { cost: 0, tokens: 0, calls: 0, models: {} };
+    meteringByDate[r.date].cost   += r.cost   || 0;
+    meteringByDate[r.date].tokens += r.tokens || 0;
+    meteringByDate[r.date].calls  += r.calls  || 0;
+    if (!meteringByDate[r.date].models[r.model]) meteringByDate[r.date].models[r.model] = 0;
+    meteringByDate[r.date].models[r.model] += r.cost || 0;
+  }
+
+  // Build daily API cost from metering (running total to find invoice trigger days)
+  const allMeteringDates = Object.keys(meteringByDate).sort();
+  let runningGateway = 0;
+  const runningByDate = {};
+  for (const d of allMeteringDates) {
+    runningGateway += meteringByDate[d].cost;
+    runningByDate[d] = runningGateway;
+  }
+
+  console.log("");
+  console.log(bold("  ENTIENT / claude-audit — RECEIPT RECONCILIATION"));
+  console.log(`  Export: ${filePath}  |  Exported: ${exportData.exported_at || "unknown"}`);
+  console.log(`  ${SL}`);
+  console.log("");
+
+  // ── Invoices section ──────────────────────────────────────────────────────
+  if (invoices.length === 0) {
+    console.log("  No Anthropic invoices found in export.");
+    console.log(`  ${dim("Visit console.anthropic.com/settings/billing while Token Slasher is active,")}`);
+    console.log(`  ${dim("then re-export.")}`);
+    console.log("");
+  } else {
+    console.log(`  INVOICES  (${invoices.length} found)`);
+    console.log(`  ${SL}`);
+    for (const inv of invoices) {
+      const amtStr = inv.amount != null ? yl(`$${Number(inv.amount).toFixed(2)}`) : yl("$?.??");
+      const status = inv.status ? `  ${dim(inv.status)}` : "";
+      console.log(`  ${(inv.id || "?").padEnd(24)}  ${(inv.date || "?").padEnd(12)}  ${amtStr}${status}`);
+
+      // Find matching gateway activity within ±3 days of invoice date
+      if (inv.date && meteringAvail) {
+        const invDate = new Date(inv.date);
+        const windowDays = 3;
+        let windowCost = 0;
+        let windowCalls = 0;
+        const topModels = {};
+        for (let di = -windowDays; di <= 0; di++) {
+          const d = new Date(invDate.getTime() + di * 86400000).toISOString().slice(0, 10);
+          const m = meteringByDate[d];
+          if (m) {
+            windowCost  += m.cost;
+            windowCalls += m.calls;
+            for (const [mdl, c] of Object.entries(m.models)) {
+              topModels[mdl] = (topModels[mdl] || 0) + c;
+            }
+          }
+        }
+        if (windowCost > 0) {
+          const topMdl = Object.entries(topModels).sort((a,b)=>b[1]-a[1])[0];
+          const mdlStr = topMdl ? `  ${dim("top model: " + topMdl[0].replace("claude-","") + " $" + topMdl[1].toFixed(2))}` : "";
+          console.log(`    ${dim("└ ENTIENT gateway ±3d:")}  ${yl("$"+windowCost.toFixed(2))}  ${dim(windowCalls+" calls")}${mdlStr}`);
+        } else {
+          console.log(`    ${dim("└ No ENTIENT gateway activity found ±3d of invoice date")}`);
+        }
+      } else if (!meteringAvail) {
+        console.log(`    ${dim("└ metering.db not found — install ENTIENT gateway to track API calls")}`);
+      }
+    }
+    console.log("");
+  }
+
+  // ── Daily API usage from Token Slasher ────────────────────────────────────
+  if (dailyUsage.length > 0) {
+    console.log(`  DAILY USAGE FROM ANTHROPIC CONSOLE  (${dailyUsage.length} rows)`);
+    console.log(`  ${SL}`);
+    for (const row of dailyUsage.slice(0, 30)) {
+      const costStr = row.cost != null ? yl(`$${Number(row.cost).toFixed(4)}`) : dim("$-");
+      const tokStr  = row.tokens != null ? dim(`${Number(row.tokens).toLocaleString()} tok`) : "";
+      const mdl     = row.model ? dim(row.model.replace("claude-","").slice(0,20).padEnd(22)) : dim("".padEnd(22));
+      console.log(`  ${(row.date||"?").padEnd(12)}  ${mdl}  ${costStr.padEnd(12)}  ${tokStr}`);
+    }
+    if (dailyUsage.length > 30) console.log(`  ${dim("... and " + (dailyUsage.length-30) + " more rows")}`);
+    console.log("");
+  }
+
+  // ── Gateway summary ────────────────────────────────────────────────────────
+  if (meteringAvail && allMeteringDates.length > 0) {
+    console.log(`  ENTIENT GATEWAY — METERED API SPEND  (metering.db)`);
+    console.log(`  ${SL}`);
+    const last30 = allMeteringDates.slice(-30);
+    for (const d of last30.reverse()) {
+      const m = meteringByDate[d];
+      const bar = "█".repeat(Math.min(Math.round(m.cost / 0.5 * 8), 16));
+      const topMdl = Object.entries(m.models).sort((a,b)=>b[1]-a[1])[0];
+      const mdlStr = topMdl ? dim(topMdl[0].replace("claude-","").slice(0,18)) : "";
+      console.log(`  ${d}   ${yl(("$"+m.cost.toFixed(4)).padStart(9))}   ${dim(m.calls+" calls")}   ${mdlStr}   ${dim(bar)}`);
+    }
+    const totalGateway = allMeteringDates.reduce((s, d) => s + meteringByDate[d].cost, 0);
+    console.log(`  ${SL}`);
+    console.log(`  Total (metering.db, all time):  ${yl("$"+totalGateway.toFixed(2))}`);
+    console.log("");
+  }
+
+  // ── Coverage gaps ──────────────────────────────────────────────────────────
+  console.log(`  ${SL}`);
+  console.log(`  COVERAGE GAPS`);
+  console.log(`  ${SL}`);
+  console.log(`  These API callers are NOT logged to metering.db:`);
+  const untracked = [
+    "bulk_synthesize.py", "gpu_worker_notebook.py", "haiku_router.py",
+    "label_worker.py", "lightning_worker.py", "mine_eye_bulk.py",
+    "openclaw_operators.py", "operator_mill.py", "operator_synthesizer.py",
+  ];
+  for (const f of untracked) console.log(`    ${dim("• entient-interceptor/tools/" + f)}`);
+  console.log(`  To close this gap: add _log_to_metering() wrapper to each file.`);
+  console.log(`  Until then, estimated untracked spend: $2-5/month (labeling/synthesis).`);
+  console.log("");
+  console.log(`  ${dim("To get full billing data: visit console.anthropic.com/settings/billing")}`);
+  console.log(`  ${dim("and console.anthropic.com/settings/usage while Token Slasher is active.")}`);
+  console.log("");
+}
+
 function main() {
   const opts = parseArgs();
 
@@ -1895,7 +2075,8 @@ function main() {
   if (opts.command === "status")    { status();    return; }
   if (opts.command === "doctor")    { doctor();    return; }
   if (opts.command === "setup")     { setup();     return; }
-  if (opts.command === "billing")   { billingReport(opts.last); return; }
+  if (opts.command === "billing")    { billingReport(opts.last); return; }
+  if (opts.command === "reconcile") { reconcile(opts.reconcileFile); return; }
 
   // Non-interactive modes
   if (opts.json) {
