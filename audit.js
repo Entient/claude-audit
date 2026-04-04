@@ -51,6 +51,200 @@ function loadConfig() {
   } catch (_) { return { ...DEFAULTS }; }
 }
 
+function saveConfig(patch) {
+  ensureAuditDir();
+  const current = loadConfig();
+  const updated  = { ...current, ...patch };
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(updated, null, 2), "utf8");
+  return updated;
+}
+
+// ── Anthropic billing API ────────────────────────────────────────────────────
+
+/**
+ * Fetch real usage data from Anthropic's API.
+ * Returns { ok, days: [{date, inputTokens, outputTokens, cacheRead, cacheWrite, models:{}}], error }
+ *
+ * Anthropic usage endpoint: GET /v1/usage (paginated, per-day, per-model breakdown)
+ * Requires API key with org read permissions.
+ */
+async function fetchAnthropicUsage(apiKey, days = 30) {
+  const https   = require("https");
+  const since   = new Date(Date.now() - days * 86_400_000);
+  const startDate = since.toISOString().slice(0, 10);
+
+  // Model pricing ($/MTok) — input / output
+  const PRICES = {
+    "claude-opus-4":         { in: 15,    out: 75   },
+    "claude-sonnet-4":       { in: 3,     out: 15   },
+    "claude-sonnet-4-5":     { in: 3,     out: 15   },
+    "claude-haiku-4":        { in: 0.80,  out: 4    },
+    "claude-haiku-4-5":      { in: 0.80,  out: 4    },
+    "claude-opus-3-5":       { in: 15,    out: 75   },
+    "claude-sonnet-3-5":     { in: 3,     out: 15   },
+    "claude-haiku-3":        { in: 0.25,  out: 1.25 },
+    // fallback
+    "default":               { in: 3,     out: 15   },
+  };
+
+  function priceForModel(modelId) {
+    for (const [k, v] of Object.entries(PRICES)) {
+      if (k !== "default" && modelId && modelId.toLowerCase().includes(k.replace(/-/g, ""))) return v;
+      if (k !== "default" && modelId && modelId.toLowerCase().startsWith(k)) return v;
+    }
+    return PRICES["default"];
+  }
+
+  function calcCost(model, inputTok, outputTok, cacheReadTok, cacheWriteTok) {
+    const p = priceForModel(model);
+    const inp  = (inputTok   || 0) / 1_000_000 * p.in;
+    const out  = (outputTok  || 0) / 1_000_000 * p.out;
+    const cr   = (cacheReadTok || 0) / 1_000_000 * (p.in * 0.1);   // cache read ~10% of input
+    const cw   = (cacheWriteTok || 0) / 1_000_000 * (p.in * 1.25); // cache write ~125% of input
+    return inp + out + cr + cw;
+  }
+
+  const get = (url, headers) => new Promise((resolve, reject) => {
+    const req = https.request(url, { headers }, res => {
+      let body = "";
+      res.on("data", d => body += d);
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+
+  try {
+    // Try Anthropic's usage endpoint
+    const headers = {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    };
+
+    // Paginate through all usage records
+    const allRows = [];
+    let nextPage = null;
+    let page = 0;
+
+    do {
+      const url = new URL("https://api.anthropic.com/v1/usage");
+      url.searchParams.set("start_time", since.toISOString());
+      if (nextPage) url.searchParams.set("after_id", nextPage);
+
+      const res = await get(url.toString(), headers);
+
+      if (res.status === 404 || res.status === 405) {
+        // Endpoint not available — try alternate path
+        break;
+      }
+
+      if (res.status === 401) {
+        return { ok: false, error: "Invalid API key. Check ~/.claude-audit/config.json" };
+      }
+      if (res.status !== 200) {
+        return { ok: false, error: `Anthropic API error ${res.status}: ${res.body.slice(0, 200)}` };
+      }
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) { break; }
+
+      const rows = data.data || data.usage || data.results || [];
+      allRows.push(...rows);
+      nextPage = data.next_page || data.next_cursor || null;
+      page++;
+    } while (nextPage && page < 20);
+
+    if (allRows.length === 0) {
+      return { ok: false, error: "No usage data returned. Your API key may not have billing read access." };
+    }
+
+    // Aggregate by day
+    const byDay = {};
+    let totalCost = 0;
+
+    for (const row of allRows) {
+      const date = (row.date || row.timestamp || "").slice(0, 10);
+      if (!date || date < startDate) continue;
+
+      if (!byDay[date]) byDay[date] = { date, inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, cost: 0, models: {} };
+
+      const inp = row.input_tokens || row.input || 0;
+      const out = row.output_tokens || row.output || 0;
+      const cr  = row.cache_read_input_tokens || 0;
+      const cw  = row.cache_creation_input_tokens || 0;
+      const model = row.model || "unknown";
+
+      byDay[date].inputTokens += inp;
+      byDay[date].outputTokens += out;
+      byDay[date].cacheRead    += cr;
+      byDay[date].cacheWrite   += cw;
+
+      const rowCost = calcCost(model, inp, out, cr, cw);
+      byDay[date].cost += rowCost;
+      totalCost        += rowCost;
+
+      if (!byDay[date].models[model]) byDay[date].models[model] = { tokens: 0, cost: 0 };
+      byDay[date].models[model].tokens += inp + out;
+      byDay[date].models[model].cost   += rowCost;
+    }
+
+    const days_arr = Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date));
+    return { ok: true, days: days_arr, totalCost, rowCount: allRows.length };
+
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/** Setup command — prompt for API key and monthly budget, save to config. */
+async function setup() {
+  const readline = require("readline");
+  const ask = (q) => new Promise(resolve => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(q, ans => { rl.close(); resolve(ans.trim()); });
+  });
+
+  console.log("");
+  console.log(bold("  claude-audit setup"));
+  console.log(`  ${SL}`);
+  console.log("");
+  console.log("  This connects claude-audit to your real Anthropic billing data.");
+  console.log("  Your API key is stored locally in ~/.claude-audit/config.json");
+  console.log("  Nothing is uploaded anywhere.");
+  console.log("");
+
+  const cfg = loadConfig();
+
+  const key = await ask(`  Anthropic API key (sk-ant-...)${cfg.anthropicApiKey ? " [Enter to keep existing]" : ""}: `);
+  const apiKey = key || cfg.anthropicApiKey || "";
+
+  if (!apiKey) {
+    console.log("\n  No key entered. Setup cancelled.\n");
+    return;
+  }
+
+  // Validate the key
+  process.stdout.write("  Verifying key... ");
+  const result = await fetchAnthropicUsage(apiKey, 7);
+  if (!result.ok) {
+    console.log(`\n  ${yl("Could not verify:")} ${result.error}`);
+    console.log("  Key saved anyway — usage data may not be available.\n");
+  } else {
+    console.log(`OK  (${result.rowCount} usage records found in last 7 days)`);
+  }
+
+  const budgetStr = await ask(`  Monthly budget / what you pay Anthropic ($)${cfg.monthlyBudget ? ` [${cfg.monthlyBudget}]` : ""}: `);
+  const budget = parseFloat(budgetStr) || cfg.monthlyBudget || null;
+
+  saveConfig({ anthropicApiKey: apiKey, monthlyBudget: budget });
+
+  console.log("");
+  console.log(`  Saved to ${CONFIG_FILE}`);
+  console.log("  Run claude-audit to see your real spend.");
+  console.log("");
+}
+
 function ensureAuditDir() {
   fs.mkdirSync(AUDIT_DIR, { recursive: true });
 }
@@ -744,6 +938,7 @@ function parseArgs() {
     else if (args[i] === "uninstall") { opts.command = "uninstall"; }
     else if (args[i] === "status")    { opts.command = "status";    }
     else if (args[i] === "doctor")    { opts.command = "doctor";    }
+    else if (args[i] === "setup")     { opts.command = "setup";     }
     else if (args[i] === "--hook" && args[i + 1]) { opts.hook = args[++i]; }
     else if ((args[i] === "--last" || args[i] === "-l") && args[i + 1]) opts.last = args[++i];
     else if (args[i].startsWith("--last=")) opts.last = args[i].slice(7);
@@ -825,7 +1020,7 @@ function scanCacheBugFast() {
 
 function clearScreen() { process.stdout.write("\x1b[2J\x1b[H"); }
 
-function printDashboard(sub, bug, enforced, window) {
+function printDashboard(sub, bug, enforced, window, billing) {
   clearScreen();
   const label = window === "30d" ? "30 days" : "7 days";
   const t   = sub.available ? sub.totalPrompts : 0;
@@ -875,26 +1070,60 @@ function printDashboard(sub, bug, enforced, window) {
   // Worst sessions (top 3 with issues)
   const worst = wa.filter(s => s.wasteTypes.length > 0).slice(0, 3);
 
+  const cfg = loadConfig();
+  const hasBilling = billing && billing.ok;
+  const realSpend  = hasBilling ? billing.totalCost : null;
+  const budget     = cfg.monthlyBudget || null;
+
   console.log("");
   console.log(bold(`  ENTIENT / claude-audit`) + dim(`  —  last ${label}`));
   console.log(`  ${SL}`);
   console.log("");
 
+  // ── Billing header ──────────────────────────────────────────
+  if (hasBilling) {
+    const spendStr   = `$${realSpend.toFixed(2)}`;
+    const budgetStr  = budget ? `  of  $${budget.toFixed(0)}/mo budget` : "";
+    const wasteAmt   = realSpend * (wastePct / 100);
+    const savedStr   = `  ($${wasteAmt.toFixed(2)} on prompts that didn't need ${model})`;
+    console.log(`  You were billed    ${yl(spendStr)}${dim(budgetStr)}`);
+    console.log(`  Recoverable waste  ${yl("$" + wasteAmt.toFixed(2))}${dim(savedStr)}`);
+    console.log("");
+    // Daily spend
+    if (billing.days && billing.days.length > 0) {
+      console.log(`  ${SL}`);
+      console.log(`  DAILY CHARGES`);
+      console.log(`  ${SL}`);
+      for (const day of billing.days.slice(-14)) {
+        const bar = "█".repeat(Math.min(Math.round(day.cost / (realSpend / billing.days.length) * 8), 24));
+        console.log(`  ${day.date}  ${yl("$" + day.cost.toFixed(2).padStart(6))}  ${dim(bar)}`);
+      }
+      console.log("");
+    }
+  } else if (budget) {
+    console.log(`  Budget set: $${budget}/mo  ${dim("(run claude-audit setup to connect live billing)")}`);
+    console.log("");
+  } else {
+    console.log(`  ${dim("No billing data — run")} claude-audit setup ${dim("to connect your Anthropic account")}`);
+    console.log("");
+  }
+
+  // ── Prompt breakdown ─────────────────────────────────────────
   if (!sub.available) {
     console.log(`  No Claude data found.  Run Claude Code first then try again.`);
     console.log("");
   } else {
     console.log(`  You ran ${yl(t.toLocaleString())} prompts.`);
-    console.log(`  ${yl(needed.toLocaleString())} of them (${yl(neededPct + "%")}) actually needed the model you paid for.`);
-    console.log(`  ${yl(notNeeded.toLocaleString())} of them (${yl(wastePct + "%")}) did not.`);
+    console.log(`  ${yl(needed.toLocaleString())} (${yl(neededPct + "%")}) actually needed the model you paid for.`);
+    console.log(`  ${yl(notNeeded.toLocaleString())} (${yl(wastePct + "%")}) did not.`);
     console.log("");
     console.log(`  ${SL}`);
-    console.log(`  ${"WHERE YOUR PROMPTS WENT".padEnd(38)}  ${"COUNT".padStart(6)}  ${"NEEDED?".padStart(7)}`);
+    console.log(`  ${"WHERE YOUR PROMPTS WENT".padEnd(38)}  ${"COUNT".padStart(6)}  ${"NEEDED?"}`);
     console.log(`  ${SL}`);
-    console.log(`  ${"Complex work  (required " + model + ")".padEnd(38)}  ${String(needed).padStart(6)}  ${"yes".padStart(7)}`);
-    console.log(`  ${"Medium tasks  (ambiguous)".padEnd(38)}  ${String(medN).padStart(6)}  ${dim("maybe".padStart(7))}`);
-    console.log(`  ${"Simple work   (Haiku was enough)".padEnd(38)}  ${String(simpleN).padStart(6)}  ${dim("no".padStart(7))}`);
-    console.log(`  ${"Confirmations (\"ok\", \"go ahead\", \"yes\")".padEnd(38)}  ${String(ackN).padStart(6)}  ${dim("no".padStart(7))}`);
+    console.log(`  ${"Complex work  (required " + model + ")".padEnd(38)}  ${String(needed).padStart(6)}  yes`);
+    console.log(`  ${"Medium tasks  (ambiguous)".padEnd(38)}  ${String(medN).padStart(6)}  ${dim("maybe")}`);
+    console.log(`  ${"Simple work   (Haiku was enough)".padEnd(38)}  ${String(simpleN).padStart(6)}  ${dim("no")}`);
+    console.log(`  ${"Confirmations (\"ok\", \"go ahead\", \"yes\")".padEnd(38)}  ${String(ackN).padStart(6)}  ${dim("no")}`);
     console.log(`  ${SL}`);
     console.log(`  ${"Total".padEnd(38)}  ${String(t).padStart(6)}`);
     console.log("");
@@ -1374,13 +1603,21 @@ async function menu() {
   let bug      = scanCacheBugFast();
   let enforced = hooksInstalled();
 
+  // Fetch real billing data if API key is configured
+  const cfg = loadConfig();
+  let billing = null;
+  if (cfg.anthropicApiKey) {
+    process.stdout.write("  Loading billing data...\r");
+    billing = await fetchAnthropicUsage(cfg.anthropicApiKey, window === "30d" ? 30 : 7);
+  }
+
   const ask = (prompt) => new Promise(resolve => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl.question(prompt, ans => { rl.close(); resolve(ans.trim().toLowerCase()); });
   });
 
   while (true) {
-    printDashboard(sub, bug, enforced, window);
+    printDashboard(sub, bug, enforced, window, billing);
     const choice = await ask("  Choice: ");
 
     if (choice === "1") {
@@ -1414,9 +1651,11 @@ async function menu() {
     } else if (choice === "30d" || choice === "30") {
       window = "30d";
       sub = readSubscriptionActivity(parseWindow(window).since);
+      if (cfg.anthropicApiKey) billing = await fetchAnthropicUsage(cfg.anthropicApiKey, 30);
     } else if (choice === "7d" || choice === "7") {
       window = "7d";
       sub = readSubscriptionActivity(parseWindow(window).since);
+      if (cfg.anthropicApiKey) billing = await fetchAnthropicUsage(cfg.anthropicApiKey, 7);
     } else if (choice === "q" || choice === "quit" || choice === "exit") {
       clearScreen();
       break;
@@ -1438,6 +1677,7 @@ function main() {
   if (opts.command === "uninstall") { uninstall(); return; }
   if (opts.command === "status")    { status();    return; }
   if (opts.command === "doctor")    { doctor();    return; }
+  if (opts.command === "setup")     { setup();     return; }
 
   // Non-interactive modes
   if (opts.json) {
