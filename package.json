@@ -1,0 +1,17 @@
+{
+  "name": "claude-audit",
+  "version": "0.1.0",
+  "description": "Claude Code subscription waste analyzer — see which sessions wasted quota on the wrong model",
+  "bin": {
+    "claude-audit": "./audit.js"
+  },
+  "scripts": {
+    "start": "node audit.js"
+  },
+  "keywords": ["claude", "claude-code", "ai-spend", "anthropic", "waste", "optimization"],
+  "author": "Entient",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  }
+}
