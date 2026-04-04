@@ -771,21 +771,22 @@ const C = {
   reset:  "\x1b[0m",
   bold:   "\x1b[1m",
   dim:    "\x1b[2m",
-  red:    "\x1b[31m",
-  green:  "\x1b[32m",
   yellow: "\x1b[33m",
-  cyan:   "\x1b[36m",
-  white:  "\x1b[37m",
-  bgRed:  "\x1b[41m",
 };
 const bold   = s => `${C.bold}${s}${C.reset}`;
 const dim    = s => `${C.dim}${s}${C.reset}`;
-const red    = s => `${C.red}${s}${C.reset}`;
-const yellow = s => `${C.yellow}${s}${C.reset}`;
-const green  = s => `${C.green}${s}${C.reset}`;
-const cyan   = s => `${C.cyan}${s}${C.reset}`;
+const yl     = s => `${C.yellow}${s}${C.reset}`;   // yellow — key numbers only
+// keep these as no-ops so existing code that calls them still compiles
+const red    = s => s;
+const yellow = s => yl(s);
+const green  = s => s;
+const cyan   = s => s;
 
 // ── Interactive menu ──────────────────────────────────────────────────────────
+
+const W2  = 64;
+const HL = "═".repeat(W2);
+const SL = "─".repeat(W2);
 
 function hooksInstalled() {
   try {
@@ -824,165 +825,278 @@ function scanCacheBugFast() {
 
 function clearScreen() { process.stdout.write("\x1b[2J\x1b[H"); }
 
-function printDashboard(sub, bug, enforced) {
+function printDashboard(sub, bug, enforced, window) {
   clearScreen();
-  const t = sub.available ? sub.totalPrompts : 0;
-  const haiku = sub.available ? sub.haikuEligible : 0;
-  const haikuPct = t > 0 ? Math.round(haiku / t * 100) : 0;
-  const wa = sub.available ? (sub.wasteAnalysis || []) : [];
-  const badSessions = wa.filter(s => s.wasteTypes.length > 0).length;
+  const label = window === "30d" ? "30 days" : "7 days";
+  const t   = sub.available ? sub.totalPrompts : 0;
+  const c   = sub.available ? (sub.complexity || {}) : {};
+  const wa  = sub.available ? (sub.wasteAnalysis || []) : [];
+  const model = sub.available ? sub.configuredModel : "sonnet";
 
-  const W2 = 58;
-  const line = "─".repeat(W2);
+  // Needed = high complexity only. Not needed = everything else.
+  const needed    = c.high || 0;
+  const notNeeded = t - needed;
+  const neededPct = t > 0 ? Math.round(needed / t * 100) : 0;
+  const wastePct  = t > 0 ? 100 - neededPct : 0;
+
+  // Per-category counts
+  const ackN    = c.continuation || 0;
+  const simpleN = c.low || 0;
+  const medN    = c.medium || 0;
+  const ackPct  = t > 0 ? Math.round(ackN / t * 100) : 0;
+
+  // Bloated sessions = context_replay waste type
+  const bloatedN = wa.filter(s => s.wasteTypes.includes("context_replay")).length;
+
+  // Dynamic: top 3 problems
+  const problems = [];
+  if (wastePct >= 20) {
+    problems.push({
+      title: `${yl(wastePct + "%")} of prompts ran on ${model} but didn't need it`,
+      fix:   `Start light sessions with /model haiku  —  switch to Sonnet when work gets complex`,
+    });
+  }
+  if (ackPct >= 20) {
+    problems.push({
+      title: `${yl(ackPct + "%")} of turns were one-word replies  ("ok", "proceed", "continue")`,
+      fix:   `Each re-sent your full conversation at full price.  Batch your intent into one prompt`,
+    });
+  }
+  if (bloatedN > 0) {
+    problems.push({
+      title: `${yl(bloatedN)} session${bloatedN > 1 ? "s" : ""} ran past 30 turns  —  context cost grew 10x by end`,
+      fix:   `Use /compact or start a fresh session after 30 turns`,
+    });
+  }
+  if (problems.length === 0 && t > 0) {
+    problems.push({ title: "No significant waste patterns detected", fix: "Sessions look clean for this period" });
+  }
+
+  // Worst sessions (top 3 with issues)
+  const worst = wa.filter(s => s.wasteTypes.length > 0).slice(0, 3);
 
   console.log("");
-  console.log(bold(`  ┌${"─".repeat(W2)}┐`));
-  console.log(bold(`  │`) + bold("  ENTIENT / claude-audit".padEnd(W2)) + bold("│"));
-  console.log(bold(`  │`) + dim("  entient.ai — AI cost enforcement".padEnd(W2)) + bold("│"));
-  console.log(bold(`  ├${line}┤`));
-  console.log(bold("  │") + `  Last 7 days`.padEnd(W2) + bold("│"));
-  console.log(bold("  │") + `  ${bold(t.toLocaleString())} prompts   ${haikuPct >= 40 ? red(bold(`${haikuPct}% wasted on wrong model`)) : green(`${haikuPct}% waste`)}   ${badSessions > 0 ? red(`${badSessions} problem sessions`) : green("0 problem sessions")}`.padEnd(W2 + 20) + bold("│"));
-  console.log(bold("  │") + "".padEnd(W2) + bold("│"));
-
-  if (bug.bugged > 0) {
-    const bugPct = Math.round(bug.bugged / bug.total * 100);
-    const bugM   = (bug.buggedTokens / 1_000_000).toFixed(0);
-    console.log(bold("  │") + `  ${yellow("⚠")} Cache bug: ${yellow(`${bugPct}% of recent sessions affected`)} (~${bugM}M tokens lost)`.padEnd(W2 + 20) + bold("│"));
-  } else {
-    console.log(bold("  │") + `  ${green("✓")} Cache bug: ${green("not affected")} (you're on a clean version)`.padEnd(W2 + 15) + bold("│"));
-  }
-
-  if (enforced) {
-    console.log(bold("  │") + `  ${green("✓")} Enforcement: ${green("active")} — blocking runaway sessions automatically`.padEnd(W2 + 15) + bold("│"));
-  } else {
-    console.log(bold("  │") + `  ${red("✗")} Enforcement: ${red("off")} — sessions can burn freely, no auto-stop`.padEnd(W2 + 20) + bold("│"));
-  }
-
-  console.log(bold(`  └${line}┘`));
+  console.log(bold(`  ENTIENT / claude-audit`) + dim(`  —  last ${label}`));
+  console.log(`  ${SL}`);
   console.log("");
-  console.log(`  ${bold("1.")} Where is my money going?`);
-  console.log(`  ${bold("2.")} Worst sessions`);
-  console.log(`  ${bold("3.")} Cache bug detail`);
-  if (enforced) {
-    console.log(`  ${bold("4.")} ${green("✓ Auto-enforcement is ON")}  ${dim("(turn off: claude-audit uninstall)")}`);
+
+  if (!sub.available) {
+    console.log(`  No Claude data found.  Run Claude Code first then try again.`);
+    console.log("");
   } else {
-    console.log(`  ${bold("4.")} ${yellow("Turn on auto-enforcement")}  ${dim("← blocks runaway sessions, saves context")}`);
+    console.log(`  You ran ${yl(t.toLocaleString())} prompts.`);
+    console.log(`  ${yl(needed.toLocaleString())} of them (${yl(neededPct + "%")}) actually needed the model you paid for.`);
+    console.log(`  ${yl(notNeeded.toLocaleString())} of them (${yl(wastePct + "%")}) did not.`);
+    console.log("");
+    console.log(`  ${SL}`);
+    console.log(`  ${"WHERE YOUR PROMPTS WENT".padEnd(38)}  ${"COUNT".padStart(6)}  ${"NEEDED?".padStart(7)}`);
+    console.log(`  ${SL}`);
+    console.log(`  ${"Complex work  (required " + model + ")".padEnd(38)}  ${String(needed).padStart(6)}  ${"yes".padStart(7)}`);
+    console.log(`  ${"Medium tasks  (ambiguous)".padEnd(38)}  ${String(medN).padStart(6)}  ${dim("maybe".padStart(7))}`);
+    console.log(`  ${"Simple work   (Haiku was enough)".padEnd(38)}  ${String(simpleN).padStart(6)}  ${dim("no".padStart(7))}`);
+    console.log(`  ${"Confirmations (\"ok\", \"go ahead\", \"yes\")".padEnd(38)}  ${String(ackN).padStart(6)}  ${dim("no".padStart(7))}`);
+    console.log(`  ${SL}`);
+    console.log(`  ${"Total".padEnd(38)}  ${String(t).padStart(6)}`);
+    console.log("");
   }
-  console.log(`  ${bold("5.")} Export report  ${dim("← shareable HTML file")}`);
-  console.log(`  ${bold("q.")} Quit`);
+
+  if (problems.length > 0) {
+    console.log(`  ${SL}`);
+    console.log(`  WHAT IS DRAINING YOUR BUDGET`);
+    console.log(`  ${SL}`);
+    console.log("");
+    for (const [i, p] of problems.entries()) {
+      console.log(`  ${i + 1}.  ${p.title}`);
+      console.log(`      ${dim("Fix:")} ${p.fix}`);
+      console.log("");
+    }
+  }
+
+  console.log(`  ${SL}`);
+  console.log(`  STATUS`);
+  console.log(`  ${SL}`);
+  const enfLabel = enforced ? "ON" : yl("OFF");
+  const enfNote  = enforced ? dim("  (sessions blocked at 10x waste, context auto-saved)") : dim("  →  type 4 to install");
+  console.log(`  Auto-enforcement    ${enfLabel}${enfNote}`);
+  const bugLabel = bug.bugged > 0 ? yl(`AFFECTED  (${Math.round(bug.bugged/bug.total*100)}% of recent sessions)`) : "CLEAR";
+  const bugNote  = bug.bugged > 0 ? dim("  →  type 3 for details") : dim("  (you're on a clean version)");
+  console.log(`  Cache bug           ${bugLabel}${bugNote}`);
+  console.log("");
+
+  if (worst.length > 0) {
+    console.log(`  ${SL}`);
+    console.log(`  WORST SESSIONS`);
+    console.log(`  ${SL}`);
+    console.log(`  ${"Project".padEnd(24)}  ${"Date".padEnd(8)}  ${"Turns".padStart(5)}  Problem`);
+    console.log(`  ${SL}`);
+    for (const s of worst) {
+      const dt      = new Date(s.lastTs).toISOString().slice(5, 10);
+      const issues  = [];
+      if (s.wasteTypes.includes("wrong_model"))    issues.push(`${s.haikuPct}% simple on ${model}`);
+      if (s.wasteTypes.includes("session_bloat"))  issues.push(`${s.ackPct}% confirmations`);
+      if (s.wasteTypes.includes("context_replay")) issues.push(`ran ${s.durationHrs}h`);
+      console.log(`  ${s.project.slice(0,24).padEnd(24)}  ${dt.padEnd(8)}  ${String(s.prompts).padStart(5)}  ${dim(issues.join(" + "))}`);
+    }
+    console.log("");
+  }
+
+  console.log(`  ${SL}`);
+  console.log(`  ${bold("1.")} detail   ${bold("2.")} sessions   ${bold("3.")} cache bug   ${bold("4.")} enforcement   ${bold("5.")} export   ${bold("q.")} quit`);
   console.log("");
 }
 
 function showMoneyScreen(sub) {
   clearScreen();
-  const t = sub.totalPrompts, c = sub.complexity, model = sub.configuredModel;
-  const haiku = sub.haikuEligible;
-  const haikuPct = t > 0 ? Math.round(haiku / t * 100) : 0;
-  const ackPct  = t > 0 ? Math.round((c.continuation||0) / t * 100) : 0;
-  const highPct = t > 0 ? Math.round((c.high||0) / t * 100) : 0;
-  const wa = sub.wasteAnalysis || [];
-  const replaySessions = wa.filter(s => s.wasteTypes.includes("context_replay")).length;
+  const t     = sub.totalPrompts;
+  const c     = sub.complexity;
+  const model = sub.configuredModel;
+  const wa    = sub.wasteAnalysis || [];
+
+  const highPct   = t > 0 ? Math.round((c.high||0)         / t * 100) : 0;
+  const medPct    = t > 0 ? Math.round((c.medium||0)        / t * 100) : 0;
+  const simPct    = t > 0 ? Math.round((c.low||0)           / t * 100) : 0;
+  const ackPct    = t > 0 ? Math.round((c.continuation||0)  / t * 100) : 0;
+  const wastePct  = 100 - highPct;
+  const bloatedN  = wa.filter(s => s.wasteTypes.includes("context_replay")).length;
 
   console.log("");
-  console.log(bold("  WHERE IS MY MONEY GOING?"));
-  console.log("  " + "─".repeat(54));
+  console.log(bold("  DETAIL — WHERE YOUR BUDGET GOES"));
+  console.log(`  ${SL}`);
   console.log("");
-  console.log(`  Wrong model          ${haikuPct >= 40 ? red(bold(`${haikuPct}%`)) : bold(`${haikuPct}%`)} of prompts didn't need ${model}.`);
-  console.log(`                       Simple questions, confirmations, one-liners.`);
-  console.log(`                       All ran on ${model} anyway.`);
+  console.log(`  Of your ${yl(t.toLocaleString())} prompts, only ${yl(highPct + "%")} actually required ${model}.`);
+  console.log(`  The other ${yl(wastePct + "%")} ran on ${model} for no reason.`);
   console.log("");
-  console.log(`  Confirmation loops   ${ackPct}% of prompts were "ok" / "proceed" / "yes".`);
-  console.log(`                       Each re-sent the entire conversation history.`);
-  console.log(`                       Zero new information. Full price.`);
-  console.log("");
-  console.log(`  Context replay       ${replaySessions} sessions ran long enough for context`);
-  console.log(`                       to balloon — 10k–30k tokens of seen history per turn.`);
-  console.log("");
-  console.log(`  Work that needed ${model}  ${bold(`${highPct}%`)} of prompts actually required it.`);
-  console.log("");
+  console.log(`  ${SL}`);
+  console.log(`  ${"TYPE".padEnd(38)}  ${"SHARE".padStart(6)}  ${"COUNT".padStart(6)}`);
+  console.log(`  ${SL}`);
 
-  // Prompt complexity bar chart
-  console.log(`  ${dim("Prompt breakdown:")}`);
-  const order = [["continuation","ACKs / one-liners "],["low","Simple questions  "],["medium","Medium tasks      "],["high","Complex work      "]];
-  for (const [key, label] of order) {
-    const n = c[key] || 0, pct = t > 0 ? Math.round(n/t*100) : 0;
-    const bar = "█".repeat(Math.round(pct / 3));
-    console.log(`  ${label}  ${dim(bar)}  ${String(pct).padStart(3)}%  (${n})`);
+  const rows = [
+    ["Confirmations  (\"ok\", \"proceed\", \"yes\")",  ackPct,  c.continuation||0,
+     `Each re-sent your full conversation. Zero new info.`],
+    ["Simple work    (one-liners, lookups)",          simPct,  c.low||0,
+     `Haiku handles these fine at ~5x lower cost.`],
+    ["Medium tasks   (ambiguous complexity)",         medPct,  c.medium||0,
+     `May need Sonnet. Depends on output quality required.`],
+    ["Complex work   (required " + model + ")",       highPct, c.high||0,
+     `This is where the subscription earns its cost.`],
+  ];
+
+  for (const [label, pct, count, note] of rows) {
+    console.log(`  ${label.padEnd(38)}  ${yl(String(pct) + "%").padStart(9)}  ${String(count).padStart(6)}`);
+    console.log(`  ${dim("  " + note)}`);
+    console.log("");
   }
+
+  console.log(`  ${SL}`);
+  console.log(`  WHAT TO DO`);
+  console.log(`  ${SL}`);
   console.log("");
+  if (wastePct >= 20) {
+    console.log(`  1.  Start light sessions with ${yl("/model haiku")}`);
+    console.log(`      ${dim("Switch to Sonnet only when the task actually gets complex.")}`);
+    console.log(`      ${dim("You'll know — responses will start to feel shallow.")}`);
+    console.log("");
+  }
+  if (ackPct >= 20) {
+    console.log(`  2.  Stop sending one-word replies`);
+    console.log(`      ${dim(`${ackPct}% of your turns were confirmations. Each one re-sent`)}`);
+    console.log(`      ${dim("your full conversation history. Write one complete prompt")}`);
+    console.log(`      ${dim("instead of three short ones.")}`);
+    console.log("");
+  }
+  if (bloatedN > 0) {
+    console.log(`  3.  Rotate sessions after 30 turns`);
+    console.log(`      ${dim(`${bloatedN} sessions ran long enough for context to balloon.`)}`);
+    console.log(`      ${dim("Use /compact or start fresh and paste a one-paragraph summary.")}`);
+    console.log("");
+  }
+  if (wastePct < 20 && ackPct < 20 && bloatedN === 0) {
+    console.log(`  Sessions look clean. No significant waste in this window.`);
+    console.log("");
+  }
+
   console.log(dim("  Press Enter to go back."));
 }
 
 function showSessionsScreen(sub) {
   clearScreen();
-  const wa = (sub.wasteAnalysis || []).slice(0, 8);
+  const wa    = (sub.wasteAnalysis || []).slice(0, 10);
   const model = sub.configuredModel;
 
   console.log("");
-  console.log(bold("  WORST SESSIONS"));
-  console.log("  " + "─".repeat(54));
-  console.log("");
+  console.log(bold("  SESSIONS — LAST 7 DAYS"));
+  console.log(`  ${SL}`);
+  console.log(`  ${"Project".padEnd(24)}  ${"Date".padEnd(10)}  ${"Turns".padStart(5)}  ${"Start model".padEnd(14)}  Problems`);
+  console.log(`  ${SL}`);
 
-  if (wa.length === 0) { console.log("  No session data."); console.log(""); return; }
-
-  for (const [i, s] of wa.entries()) {
-    const dt    = new Date(s.lastTs).toISOString().slice(5, 16).replace("T", " ");
-    const badge = s.wasteTypes.length >= 2 ? red("⚠⚠ triple-cost") : s.wasteTypes.length === 1 ? yellow("⚠ issue") : green("✓ ok");
-
-    console.log(`  ${bold(`${i+1}.`)} ${bold(s.project)}  ${dim(dt)}  ${badge}`);
-    console.log(`     ${s.prompts} turns over ${s.durationHrs}h`);
-
-    if (s.wasteTypes.includes("wrong_model")) {
-      console.log(`     ${red("✗")} ${s.haikuPct}% of prompts were simple — ran on ${model} for no reason`);
-      console.log(`       ${dim(`Fix: start this kind of session with /model haiku`)}`);
-    }
-    if (s.wasteTypes.includes("session_bloat")) {
-      console.log(`     ${red("✗")} ${s.ackPct}% were confirmations — each one replayed full context`);
-      console.log(`       ${dim("Fix: batch your intent, stop sending one-word replies")}`);
-    }
-    if (s.wasteTypes.includes("context_replay")) {
-      console.log(`     ${red("✗")} Session ran ${s.durationHrs}h — context ballooned by turn 30+`);
-      console.log(`       ${dim("Fix: /compact or start a fresh session after 30 turns")}`);
-    }
-    if (s.wasteTypes.length === 0) {
-      console.log(`     ${green("No significant waste detected.")}`);
-    }
-
-    console.log(`     ${dim(`→ Should have started on: ${s.recommendedStartModel.toUpperCase()} — ${s.escalation}`)}`);
+  if (wa.length === 0) {
+    console.log("  No session data.");
     console.log("");
+    console.log(dim("  Press Enter to go back."));
+    return;
   }
+
+  for (const s of wa) {
+    const dt      = new Date(s.lastTs).toISOString().slice(5, 10);
+    const issues  = [];
+    if (s.wasteTypes.includes("wrong_model"))    issues.push(`${s.haikuPct}% simple on ${model}`);
+    if (s.wasteTypes.includes("session_bloat"))  issues.push(`${s.ackPct}% confirmations`);
+    if (s.wasteTypes.includes("context_replay")) issues.push(`ran ${s.durationHrs}h`);
+    const issueStr = issues.length ? yl(issues.join(" + ")) : dim("clean");
+    const startMod = s.recommendedStartModel.toUpperCase().padEnd(14);
+
+    console.log(`  ${s.project.slice(0,24).padEnd(24)}  ${dt.padEnd(10)}  ${String(s.prompts).padStart(5)}  ${dim(startMod)}  ${issueStr}`);
+  }
+
+  console.log("");
+  console.log(`  ${SL}`);
+  console.log(`  WHAT THESE MEAN`);
+  console.log(`  ${SL}`);
+  console.log("");
+  console.log(`  "simple on ${model}"     ${dim(`That % of prompts didn't need ${model}. Use /model haiku to start.`)}`);
+  console.log(`  "confirmations"       ${dim("That % were one-word replies that re-sent full context.")}`);
+  console.log(`  "ran Xh"              ${dim("Session ran long — context cost grew 10x per prompt by end.")}`);
+  console.log(`  Start model column    ${dim("What model this session should have opened on.")}`);
+  console.log("");
   console.log(dim("  Press Enter to go back."));
 }
 
 function showCacheScreen(bug) {
   clearScreen();
+  const pct  = bug.total > 0 ? Math.round(bug.bugged / bug.total * 100) : 0;
+  const bugM = (bug.buggedTokens / 1_000_000).toFixed(0);
+  const bugG = (bug.buggedTokens / 1_000_000_000).toFixed(1);
+  const bigNum = parseFloat(bugG) >= 1 ? bugG + "B" : bugM + "M";
+
   console.log("");
   console.log(bold("  CACHE BUG"));
-  console.log("  " + "─".repeat(54));
+  console.log(`  ${SL}`);
   console.log("");
-  console.log(`  Claude Code versions ${bold("2.1.69 – 2.1.89")} had a broken prompt cache.`);
-  console.log(`  Instead of reusing cached context, every turn paid full price`);
-  console.log(`  to re-process the entire conversation history.`);
-  console.log(`  Effect: ${bold("10–20x token burn")} on long sessions.`);
+  console.log(`  Claude Code versions 2.1.69 – 2.1.89 had a broken prompt cache.`);
+  console.log(`  Instead of reusing cached context, every turn re-processed`);
+  console.log(`  the full conversation from scratch.`);
+  console.log(`  Effect: 10–20x token burn on sessions longer than 10 turns.`);
+  console.log("");
+  console.log(`  ${SL}`);
+  console.log(`  YOUR STATUS`);
+  console.log(`  ${SL}`);
   console.log("");
 
   if (bug.bugged > 0) {
-    const pct  = Math.round(bug.bugged / bug.total * 100);
-    const bugG = (bug.buggedTokens / 1_000_000_000).toFixed(1);
-    const bugM = (bug.buggedTokens / 1_000_000).toFixed(0);
-    console.log(`  ${red(bold("YOUR IMPACT"))}`);
-    console.log(`  ${red(`${bug.bugged} of ${bug.total}`)} sessions (${red(`${pct}%`)}) ran under this bug.`);
-    console.log(`  ~${bold(bugG > "1.0" ? bugG + "B" : bugM + "M")} tokens consumed with broken caching.`);
-    console.log(`  These tokens are spent. They cannot be recovered.`);
+    console.log(`  Affected sessions    ${yl(bug.bugged + " of " + bug.total)}  (${yl(pct + "%")} of your last 14 days)`);
+    console.log(`  Tokens burned        ${yl("~" + bigNum)}  (estimated — cannot be recovered)`);
+    console.log(`  Current version      CLEAR  (caching is working correctly now)`);
     console.log("");
-    console.log(`  ${yellow("You're now on a clean version.")} The bug is behind you.`);
-    console.log(`  Going forward, caching works correctly.`);
+    console.log(`  The tokens are gone. Going forward you are on a clean version.`);
   } else {
-    console.log(`  ${green(bold("You were not affected."))} Your sessions ran on clean versions.`);
+    console.log(`  Affected sessions    0  (none of your recent sessions hit this bug)`);
+    console.log(`  Current version      CLEAR`);
+    console.log("");
+    console.log(`  You were not affected. No action needed.`);
   }
 
   console.log("");
-  console.log(`  ${dim("Run: claude update  (if you haven't already)")}`);
+  console.log(`  ${dim("To update: claude update")}`);
   console.log("");
   console.log(dim("  Press Enter to go back."));
 }
@@ -991,29 +1105,32 @@ function showEnforceScreen(enforced) {
   clearScreen();
   console.log("");
   console.log(bold("  AUTO-ENFORCEMENT"));
-  console.log("  " + "─".repeat(54));
+  console.log(`  ${SL}`);
   console.log("");
 
   if (enforced) {
-    console.log(`  ${green(bold("✓ Active."))} Enforcement hooks are installed.`);
+    console.log(`  Status    ON`);
     console.log("");
-    console.log(`  When a session hits ${bold("10x waste factor:")} `);
-    console.log(`    · Claude is blocked before the next prompt burns tokens`);
-    console.log(`    · Your session state is saved (branch, files, what you were doing)`);
-    console.log(`    · Start a fresh session — context is injected automatically`);
+    console.log(`  What it does:`);
+    console.log(`    When a session uses ${yl("10x")} more tokens per turn than it started,`);
+    console.log(`    Claude is blocked before the next prompt burns any more.`);
+    console.log(`    Your session state is saved — branch, open files, what you were doing.`);
+    console.log(`    Start a fresh session and context is injected automatically.`);
+    console.log("");
+    console.log(`  Config     ~/.claude-audit/config.json`);
+    console.log(`  ${dim("Threshold, min turns, baseline window — all adjustable.")}`);
     console.log("");
     console.log(`  ${dim("To turn off: claude-audit uninstall")}`);
-    console.log(`  ${dim("To configure threshold: edit ~/.claude-audit/config.json")}`);
   } else {
-    console.log(`  ${yellow("Not installed.")} Your sessions can run indefinitely.`);
+    console.log(`  Status    ${yl("OFF")}`);
     console.log("");
     console.log(`  With enforcement on:`);
-    console.log(`    · Sessions that hit ${bold("10x waste")} are automatically blocked`);
-    console.log(`    · Context saved before compaction so you never lose your place`);
-    console.log(`    · Fresh session starts with full awareness of the previous one`);
-    console.log(`    · Works silently in the background — no manual monitoring`);
+    console.log(`    Sessions that bloat past ${yl("10x")} waste are blocked automatically.`);
+    console.log(`    Context is saved before the block — branch, files, what you were doing.`);
+    console.log(`    Next session opens with that context injected. You pick up where you left off.`);
+    console.log(`    Nothing to monitor. It runs in the background.`);
     console.log("");
-    console.log(`  ${bold("Install now?")}  Type ${cyan("y")} to install, or Enter to go back.`);
+    console.log(`  Type ${yl("y")} to install now, or press Enter to go back.`);
   }
   console.log("");
 }
@@ -1251,11 +1368,11 @@ function exportReport(sub, bug, enforced) {
 async function menu() {
   const readline = require("readline");
 
-  const { since } = parseWindow("7d");
+  let window = "7d";
   process.stdout.write("  Loading...\r");
-  const sub = readSubscriptionActivity(since);
-  const bug = scanCacheBugFast();
-  const enforced = hooksInstalled();
+  let sub      = readSubscriptionActivity(parseWindow(window).since);
+  let bug      = scanCacheBugFast();
+  let enforced = hooksInstalled();
 
   const ask = (prompt) => new Promise(resolve => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1263,7 +1380,7 @@ async function menu() {
   });
 
   while (true) {
-    printDashboard(sub, bug, enforced);
+    printDashboard(sub, bug, enforced, window);
     const choice = await ask("  Choice: ");
 
     if (choice === "1") {
@@ -1284,8 +1401,9 @@ async function menu() {
         const ans = await ask("  Choice: ");
         if (ans === "y") {
           install();
+          enforced = true;
           console.log("");
-          console.log(green("  ✓ Enforcement installed. Restart Claude Code to activate."));
+          console.log(`  Enforcement installed. Restart Claude Code to activate.`);
           console.log("");
           await ask("  Press Enter to continue.");
         }
@@ -1293,6 +1411,12 @@ async function menu() {
     } else if (choice === "5") {
       exportReport(sub, bug, enforced);
       await ask("  Press Enter to continue.");
+    } else if (choice === "30d" || choice === "30") {
+      window = "30d";
+      sub = readSubscriptionActivity(parseWindow(window).since);
+    } else if (choice === "7d" || choice === "7") {
+      window = "7d";
+      sub = readSubscriptionActivity(parseWindow(window).since);
     } else if (choice === "q" || choice === "quit" || choice === "exit") {
       clearScreen();
       break;
