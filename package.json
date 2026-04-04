@@ -1,17 +1,25 @@
 {
   "name": "claude-audit",
-  "version": "0.1.0",
-  "description": "Claude Code subscription waste analyzer — see which sessions wasted quota on the wrong model",
+  "version": "0.2.0",
+  "description": "Claude Code session enforcer + waste analyzer. Blocks runaway sessions, saves context across compactions, auto-injects context on resume.",
   "bin": {
     "claude-audit": "./audit.js"
   },
   "scripts": {
     "start": "node audit.js"
   },
-  "keywords": ["claude", "claude-code", "ai-spend", "anthropic", "waste", "optimization"],
+  "keywords": ["claude", "claude-code", "ai-spend", "anthropic", "waste", "optimization", "hooks", "enforcement", "session", "context"],
   "author": "Entient",
   "license": "MIT",
   "engines": {
     "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Entient/claude-audit"
+  },
+  "homepage": "https://github.com/Entient/claude-audit#readme",
+  "bugs": {
+    "url": "https://github.com/Entient/claude-audit/issues"
   }
 }
