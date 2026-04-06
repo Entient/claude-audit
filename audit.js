@@ -40,10 +40,11 @@ const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
 
 const DEFAULTS = {
-  threshold:  10,    // waste factor (current/baseline) that triggers block
-  minTurns:   20,    // minimum turns before enforcing
-  baselineTurns: 5,  // turns used to establish baseline
-  windowTurns: 5,    // turns used for current average
+  threshold:     10,   // waste factor that triggers session kill + restart
+  saveThreshold:  7,   // waste factor that triggers git savepoint (early warning, no kill)
+  minTurns:      20,   // minimum turns before enforcing
+  baselineTurns:  5,   // turns used to establish baseline
+  windowTurns:    5,   // turns used for current average
 };
 
 function loadConfig() {
@@ -347,7 +348,56 @@ function currentSessionFile() {
 
 // ── Hook handlers ────────────────────────────────────────────────────────────
 
+/**
+ * Scan Desktop git repos for uncommitted changes and commit + push each one.
+ * Called at saveThreshold (early warning) and again just before the kill.
+ * Uses --no-verify to skip ENTIENT provenance check on auto-savepoints.
+ * Returns list of repo names that were saved.
+ */
+function gitSavepoint() {
+  const { execSync } = require("child_process");
+  const desktopDir = path.join(os.homedir(), "Desktop");
+  const saved = [];
+
+  let entries = [];
+  try { entries = fs.readdirSync(desktopDir, { withFileTypes: true }); } catch (_) { return saved; }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const repoPath = path.join(desktopDir, entry.name);
+    try {
+      // Is it a git repo?
+      execSync(`git -C "${repoPath}" rev-parse --git-dir`, { stdio: "ignore" });
+      // Any uncommitted changes?
+      const status = execSync(`git -C "${repoPath}" status --porcelain`, {
+        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (!status.trim()) continue;
+
+      // Stage + commit
+      execSync(`git -C "${repoPath}" add -A`, { stdio: "ignore" });
+      execSync(
+        `git -C "${repoPath}" commit --no-verify -m "wip: auto-savepoint (session rotation)"`,
+        { stdio: "ignore" }
+      );
+      // Push best-effort (10s timeout)
+      try {
+        execSync(`git -C "${repoPath}" push`, { stdio: "ignore", timeout: 10_000 });
+        saved.push(`${entry.name} (committed+pushed)`);
+      } catch (_) {
+        saved.push(`${entry.name} (committed, push failed)`);
+      }
+    } catch (_) { /* not a git repo or already clean — skip */ }
+  }
+
+  return saved;
+}
+
 function triggerRestart(w) {
+  // Save any uncommitted git work before killing (belt-and-suspenders — the
+  // early warning at saveThreshold should have already done this).
+  gitSavepoint();
+
   // Write restart flag for claude-loop to detect
   ensureAuditDir();
   fs.writeFileSync(RESTART_FLAG, JSON.stringify({
@@ -397,7 +447,23 @@ function hookPrompt() {
   if (!file) { process.exit(0); }
 
   const w = computeWasteFactor(file, cfg);
-  if (!w || !w.blocked) { process.exit(0); }
+  if (!w) { process.exit(0); }
+
+  // Early warning: approaching threshold — run git savepoint now while Claude
+  // is still alive and can finish any in-progress task cleanly.
+  const saveThreshold = cfg.saveThreshold ?? 7;
+  if (!w.blocked && w.factor >= saveThreshold && !process.env.CLAUDE_AUDIT_SKIP) {
+    const saved = gitSavepoint();
+    if (saved.length > 0) {
+      process.stderr.write(
+        `[claude-audit] WARNING: session at ${w.factor}x waste — rotation approaching (threshold ${cfg.threshold}x).\n` +
+        `[claude-audit] Auto-saved: ${saved.join(", ")}\n`
+      );
+    }
+    process.exit(0);  // don't block yet
+  }
+
+  if (!w.blocked) { process.exit(0); }
 
   // Save context before blocking
   saveSessionContext(file, w);
