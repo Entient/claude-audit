@@ -36,14 +36,15 @@ const AUDIT_DIR       = path.join(os.homedir(), ".claude-audit");
 const LAST_SESSION    = path.join(AUDIT_DIR, "last-session.md");
 const RESTART_FLAG    = path.join(AUDIT_DIR, "restart-flag");   // watched by claude-loop
 const CONFIG_FILE     = path.join(AUDIT_DIR, "config.json");
+const SHADOW_LOG      = path.join(AUDIT_DIR, "shadow_log.jsonl");
 const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
 
 const DEFAULTS = {
-  threshold:     10,   // waste factor that triggers session kill + restart
-  saveThreshold:  7,   // waste factor that triggers git savepoint (early warning, no kill)
-  minTurns:      20,   // minimum turns before enforcing
+  threshold:      5,   // waste factor that triggers session kill + restart (5x = each turn costs 5x session start)
+  saveThreshold:  3,   // waste factor that triggers git savepoint + warning (early signal)
+  minTurns:      15,   // minimum turns before enforcing
   baselineTurns:  5,   // turns used to establish baseline
   windowTurns:    5,   // turns used for current average
   mode:      "enforce", // "enforce" = block at threshold | "shadow" = warn only, never block
@@ -253,6 +254,30 @@ function ensureAuditDir() {
   fs.mkdirSync(AUDIT_DIR, { recursive: true });
 }
 
+function logShadowEvent(event, file, w, cfg) {
+  ensureAuditDir();
+  // Extract project name from session file path
+  const parts = (file || "").replace(/\\/g, "/").split("/");
+  const projIdx = parts.indexOf("projects");
+  const project = projIdx >= 0 ? decodeURIComponent(parts[projIdx + 1] || "unknown") : "unknown";
+  const sessionFile = parts[parts.length - 1] || "unknown";
+
+  const record = {
+    ts:        new Date().toISOString(),
+    event,                               // "would_block_prompt" | "would_block_tool" | "approaching"
+    factor:    w.factor,
+    threshold: cfg.threshold,
+    turns:     w.turns,
+    baseline:  w.baseline,
+    current:   w.current,
+    project:   project.slice(0, 60),
+    session:   sessionFile.replace(".jsonl", "").slice(0, 20),
+  };
+  try {
+    fs.appendFileSync(SHADOW_LOG, JSON.stringify(record) + "\n", "utf8");
+  } catch (_) {}
+}
+
 // ── Session JSONL reader ─────────────────────────────────────────────────────
 
 /**
@@ -455,6 +480,7 @@ function hookPrompt() {
   // is still alive and can finish any in-progress task cleanly.
   const saveThreshold = cfg.saveThreshold ?? 7;
   if (!w.blocked && w.factor >= saveThreshold && !process.env.CLAUDE_AUDIT_SKIP) {
+    if (cfg.mode === "shadow") logShadowEvent("approaching", file, w, cfg);
     const saved = gitSavepoint();
     if (saved.length > 0) {
       process.stderr.write(
@@ -469,6 +495,7 @@ function hookPrompt() {
 
   // Shadow mode: warn but never block
   if (cfg.mode === "shadow") {
+    logShadowEvent("would_block_prompt", file, w, cfg);
     process.stderr.write(
       `[claude-audit] SHADOW: session at ${w.factor}x waste after ${w.turns} turns` +
       ` (enforce threshold: ${cfg.threshold}x). Observing only.\n`
@@ -521,6 +548,7 @@ function hookTool() {
 
   // Shadow mode: warn but never block
   if (cfg.mode === "shadow") {
+    logShadowEvent("would_block_tool", file, w, cfg);
     process.stderr.write(
       `[claude-audit] SHADOW: session at ${w.factor}x waste after ${w.turns} turns` +
       ` (enforce threshold: ${cfg.threshold}x). Observing only.\n`
@@ -771,6 +799,92 @@ if ($restarts -ge $maxRestarts) {
 `;
 }
 
+function shadowReport() {
+  if (!fs.existsSync(SHADOW_LOG)) {
+    console.log("\n  No shadow events yet. Keep working — data accumulates as sessions run.\n");
+    return;
+  }
+
+  const lines = fs.readFileSync(SHADOW_LOG, "utf8").split("\n").filter(Boolean);
+  const events = lines.map(l => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean);
+
+  if (events.length === 0) {
+    console.log("\n  No shadow events logged yet.\n");
+    return;
+  }
+
+  const byType   = {};
+  const byFactor = {};
+  const byProj   = {};
+  let minFactor = Infinity, maxFactor = 0, sumFactor = 0;
+
+  for (const e of events) {
+    byType[e.event] = (byType[e.event] || 0) + 1;
+    byProj[e.project] = (byProj[e.project] || 0) + 1;
+    const bucket = Math.floor(e.factor);
+    byFactor[bucket] = (byFactor[bucket] || 0) + 1;
+    if (e.factor < minFactor) minFactor = e.factor;
+    if (e.factor > maxFactor) maxFactor = e.factor;
+    sumFactor += e.factor;
+  }
+
+  const avgFactor = (sumFactor / events.length).toFixed(1);
+  const threshold = events[0]?.threshold ?? 10;
+  const first = events[0]?.ts?.slice(0, 10) ?? "?";
+  const last  = events[events.length - 1]?.ts?.slice(0, 10) ?? "?";
+
+  console.log("");
+  console.log(bold("  CLAUDE-AUDIT — SHADOW MODE REPORT"));
+  console.log(`  ${SL}`);
+  console.log(`  Period: ${first} → ${last}    Events: ${events.length}    Threshold: ${threshold}x`);
+  console.log("");
+
+  console.log(`  EVENT TYPES`);
+  for (const [t, n] of Object.entries(byType).sort((a,b) => b[1]-a[1])) {
+    const label = t === "would_block_prompt" ? "Would have blocked prompt" :
+                  t === "would_block_tool"   ? "Would have blocked tool"  :
+                  t === "approaching"        ? "Approaching (early warning)" : t;
+    console.log(`    ${label.padEnd(32)}  ${n}`);
+  }
+  console.log("");
+
+  console.log(`  WASTE FACTOR DISTRIBUTION  (when events fired)`);
+  console.log(`    Min: ${minFactor}x    Avg: ${avgFactor}x    Max: ${maxFactor}x`);
+  const buckets = Object.entries(byFactor).map(([k,v]) => [parseInt(k),v]).sort((a,b)=>a[0]-b[0]);
+  for (const [f, n] of buckets) {
+    const bar = "█".repeat(Math.min(n, 30));
+    console.log(`    ${(f+"x–"+(f+1)+"x").padEnd(10)}  ${String(n).padStart(3)}  ${dim(bar)}`);
+  }
+  console.log("");
+
+  // Threshold recommendation
+  const wouldBlock = events.filter(e => e.event !== "approaching");
+  const lowFires = wouldBlock.filter(e => e.factor < 5).length;
+  const medFires = wouldBlock.filter(e => e.factor >= 5 && e.factor < 10).length;
+  console.log(`  THRESHOLD SIGNAL`);
+  if (wouldBlock.length === 0) {
+    console.log(`    No full-block events yet — only early warnings. Current ${threshold}x threshold hasn't been hit.`);
+  } else if (avgFactor < 6) {
+    console.log(`    Avg factor at fire: ${avgFactor}x — threshold ${threshold}x is TOO HIGH.`);
+    console.log(`    Recommend: lower to 5x-6x to catch sessions earlier.`);
+  } else if (avgFactor > threshold * 0.9) {
+    console.log(`    Avg factor at fire: ${avgFactor}x — sessions were already deep when caught.`);
+    console.log(`    Recommend: lower threshold to ${Math.round(avgFactor * 0.6)}x-${Math.round(avgFactor * 0.7)}x.`);
+  } else {
+    console.log(`    Avg factor at fire: ${avgFactor}x — threshold ${threshold}x looks reasonable.`);
+  }
+  console.log("");
+
+  console.log(`  TOP PROJECTS`);
+  for (const [proj, n] of Object.entries(byProj).sort((a,b) => b[1]-a[1]).slice(0, 5)) {
+    console.log(`    ${proj.slice(0, 40).padEnd(40)}  ${n} event(s)`);
+  }
+  console.log("");
+  console.log(`  Log: ${SHADOW_LOG}`);
+  console.log(`  To reset: delete the log file and start fresh.`);
+  console.log("");
+}
+
 function installShadow() {
   // 1. Install base hooks (idempotent)
   install();
@@ -830,7 +944,8 @@ function status() {
     if (w.baseline) {
       console.log(`    Baseline:      ~${(w.baseline/1000).toFixed(0)}k tokens/turn`);
       console.log(`    Current:       ~${(w.current/1000).toFixed(0)}k tokens/turn`);
-      console.log(`    Waste factor:  ${w.factor}x ${w.factor >= DEFAULTS.threshold ? "⚠ WOULD BLOCK" : "✓ ok"}`);
+      const cfg2 = loadConfig();
+      console.log(`    Waste factor:  ${w.factor}x ${w.factor >= cfg2.threshold ? "⚠ WOULD BLOCK" : w.factor >= cfg2.saveThreshold ? "⚠ APPROACHING" : "✓ ok"}`);
     }
   }
 
@@ -1363,6 +1478,7 @@ function parseArgs() {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "install" && args[i+1] === "--shadow") { opts.command = "install-shadow"; i++; }
     else if (args[i] === "install-shadow")   { opts.command = "install-shadow";    }
+    else if (args[i] === "shadow-report" || args[i] === "shadow-log") { opts.command = "shadow-report"; }
     else if (args[i] === "install")               { opts.command = "install";           }
     else if (args[i] === "install-autorestart") { opts.command = "install-autorestart"; }
     else if (args[i] === "uninstall")        { opts.command = "uninstall";         }
@@ -2405,6 +2521,7 @@ function main() {
   // Management commands
   if (opts.command === "install")            { install();            return; }
   if (opts.command === "install-shadow")     { installShadow();      return; }
+  if (opts.command === "shadow-report")     { shadowReport();       return; }
   if (opts.command === "install-autorestart") { installAutorestart(); return; }
   if (opts.command === "uninstall")          { uninstall();          return; }
   if (opts.command === "status")    { status();    return; }
