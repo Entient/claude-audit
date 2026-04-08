@@ -615,6 +615,44 @@ function hookStart() {
 
 // ── Context preservation ─────────────────────────────────────────────────────
 
+/**
+ * Extract the last N assistant text blocks from a session JSONL file.
+ * Returns a trimmed string, or null if nothing useful found.
+ */
+function getLastActivity(sessionFile, maxEntries = 2, maxCharsEach = 1200) {
+  try {
+    const raw   = fs.readFileSync(sessionFile, "utf8").trim();
+    const lines = raw.split("\n").filter(Boolean);
+    const excerpts = [];
+
+    for (let i = lines.length - 1; i >= 0 && excerpts.length < maxEntries; i--) {
+      let entry;
+      try { entry = JSON.parse(lines[i]); } catch (_) { continue; }
+
+      // Claude Code session JSONL: messages have role "assistant" or wrapped in message.role
+      const role = entry.role || entry.message?.role;
+      if (role !== "assistant") continue;
+
+      const content = entry.content ?? entry.message?.content ?? "";
+      let text = "";
+      if (Array.isArray(content)) {
+        text = content
+          .filter(c => c.type === "text")
+          .map(c => c.text || "")
+          .join("\n")
+          .trim();
+      } else {
+        text = String(content).trim();
+      }
+
+      if (text.length < 20) continue;  // skip trivial ack messages
+      excerpts.unshift(text.slice(0, maxCharsEach) + (text.length > maxCharsEach ? "…" : ""));
+    }
+
+    return excerpts.length > 0 ? excerpts.join("\n\n---\n\n") : null;
+  } catch (_) { return null; }
+}
+
 function saveSessionContext(sessionFile, waste) {
   ensureAuditDir();
 
@@ -622,6 +660,7 @@ function saveSessionContext(sessionFile, waste) {
   const project    = path.basename(projectDir);
   const branch     = getGitBranch(projectDir);
   const modified   = getModifiedFiles(projectDir);
+  const lastWork   = sessionFile ? getLastActivity(sessionFile) : null;
 
   const lines = [
     `# Previous Session (saved by claude-audit)`,
@@ -637,6 +676,7 @@ function saveSessionContext(sessionFile, waste) {
     `## Resume`,
     `Continue where you left off. The session was rotated to save quota.`,
     `Check git status for open changes.`,
+    lastWork ? `\n## Last Activity\n${lastWork}` : null,
   ].filter(l => l !== null).join("\n");
 
   fs.writeFileSync(LAST_SESSION, lines, "utf8");
