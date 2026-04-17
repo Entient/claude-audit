@@ -213,6 +213,120 @@ async function fetchAnthropicUsage(apiKey, days = 30) {
   }
 }
 
+/**
+ * POST /v1/messages/count_tokens — Anthropic's free pre-flight token counter.
+ * Counts tokens in a Message (including tools, system, images, docs) WITHOUT creating it.
+ * Use this to measure deflection savings instead of estimating at AVG_TOKENS_PER_INFERENCE.
+ *
+ * Returns { ok, input_tokens, error }.
+ */
+async function countTokens(apiKey, { model = "claude-sonnet-4-5", messages, system, tools }) {
+  const https = require("https");
+  if (!apiKey) return { ok: false, error: "No API key. Run: claude-audit setup" };
+  if (!messages || !Array.isArray(messages)) {
+    return { ok: false, error: "messages array is required" };
+  }
+  const body = JSON.stringify({
+    model,
+    messages,
+    ...(system ? { system } : {}),
+    ...(tools ? { tools } : {}),
+  });
+  return new Promise(resolve => {
+    const req = https.request("https://api.anthropic.com/v1/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+      },
+    }, res => {
+      let buf = "";
+      res.on("data", d => buf += d);
+      res.on("end", () => {
+        if (res.statusCode !== 200) {
+          return resolve({ ok: false, error: `HTTP ${res.statusCode}: ${buf.slice(0, 200)}` });
+        }
+        try {
+          const parsed = JSON.parse(buf);
+          resolve({ ok: true, input_tokens: parsed.input_tokens });
+        } catch (e) { resolve({ ok: false, error: "Bad JSON: " + e.message }); }
+      });
+    });
+    req.on("error", err => resolve({ ok: false, error: err.message }));
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Admin API — authoritative cost report in dollars (no client-side price-table estimation).
+ * Requires an ADMIN API key (starts with `sk-ant-admin...` or `apikey_...`), not a regular `sk-ant-...` key.
+ * Endpoint: GET /v1/organizations/cost_report
+ *
+ * Returns { ok, totalCost, byDay: [{date, cost}], byWorkspace: {...}, error }.
+ */
+async function fetchAnthropicCostReport(adminKey, days = 30) {
+  const https = require("https");
+  if (!adminKey) {
+    return { ok: false, error: "No admin key. Run: claude-audit setup --admin" };
+  }
+  const since = new Date(Date.now() - days * 86_400_000);
+  const startDate = since.toISOString().slice(0, 10);
+
+  const get = (url, headers) => new Promise((resolve, reject) => {
+    const req = https.request(url, { headers }, res => {
+      let body = ""; res.on("data", d => body += d);
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject); req.end();
+  });
+
+  try {
+    const headers = {
+      "x-api-key": adminKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    };
+    const url = new URL("https://api.anthropic.com/v1/organizations/cost_report");
+    url.searchParams.set("starting_at", since.toISOString());
+
+    const res = await get(url.toString(), headers);
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "Admin key rejected (need apikey_... or sk-ant-admin...)" };
+    }
+    if (res.status === 404) {
+      return { ok: false, error: "cost_report endpoint unavailable for this org" };
+    }
+    if (res.status !== 200) {
+      return { ok: false, error: `Admin API error ${res.status}: ${res.body.slice(0, 200)}` };
+    }
+
+    let data;
+    try { data = JSON.parse(res.body); } catch (_) {
+      return { ok: false, error: "Bad JSON from cost_report" };
+    }
+
+    const rows = data.data || [];
+    const byDay = {};
+    let totalCost = 0;
+    for (const row of rows) {
+      const date = (row.starting_at || row.date || "").slice(0, 10);
+      if (!date || date < startDate) continue;
+      const cost = parseFloat(row.amount?.value || row.cost || 0);
+      byDay[date] = (byDay[date] || 0) + cost;
+      totalCost += cost;
+    }
+    const byDayArr = Object.entries(byDay).map(([date, cost]) => ({ date, cost }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return { ok: true, totalCost, byDay: byDayArr, rowCount: rows.length, source: "admin_api" };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 /** Setup command — prompt for API key and monthly budget, save to config. */
 async function setup() {
   const readline = require("readline");
@@ -253,7 +367,27 @@ async function setup() {
   const budgetStr = await ask(`  Monthly budget / what you pay Anthropic ($)${cfg.monthlyBudget ? ` [${cfg.monthlyBudget}]` : ""}: `);
   const budget = parseFloat(budgetStr) || cfg.monthlyBudget || null;
 
-  saveConfig({ anthropicApiKey: apiKey, monthlyBudget: budget });
+  console.log("");
+  console.log("  " + dim("Optional: Admin API key (apikey_... or sk-ant-admin...)"));
+  console.log("  " + dim("If you paste one, claude-audit uses the authoritative /v1/organizations/cost_report"));
+  console.log("  " + dim("endpoint instead of estimating cost from the client-side price table."));
+  const adminKey = await ask(`  Admin API key${cfg.anthropicAdminKey ? " [Enter to keep existing, 'clear' to remove]" : " [Enter to skip]"}: `);
+  let finalAdminKey = cfg.anthropicAdminKey || "";
+  if (adminKey === "clear") finalAdminKey = "";
+  else if (adminKey) finalAdminKey = adminKey;
+
+  if (finalAdminKey && finalAdminKey !== cfg.anthropicAdminKey) {
+    process.stdout.write("  Verifying admin key... ");
+    const adminRes = await fetchAnthropicCostReport(finalAdminKey, 7);
+    if (!adminRes.ok) {
+      console.log(`\n  ${yl("Could not verify:")} ${adminRes.error}`);
+      console.log("  Key saved anyway.\n");
+    } else {
+      console.log(`OK  ($${adminRes.totalCost.toFixed(2)} reported for last 7 days)`);
+    }
+  }
+
+  saveConfig({ anthropicApiKey: apiKey, anthropicAdminKey: finalAdminKey, monthlyBudget: budget });
 
   console.log("");
   console.log(`  Saved to ${CONFIG_FILE}`);
@@ -1723,6 +1857,10 @@ function parseArgs() {
     }
     else if (args[i] === "gate-stats") { opts.command = "gate-stats"; }
     else if (args[i] === "hud")              { opts.command = "hud";               }
+    else if (args[i] === "count-tokens")     { opts.command = "count-tokens";      }
+    else if (args[i] === "cost-report")      { opts.command = "cost-report";       }
+    else if (args[i] === "--model" && args[i + 1]) { opts.model = args[++i]; }
+    else if (args[i] === "--text" && args[i + 1])  { opts.text = args[++i]; }
     else if (args[i] === "--context" && args[i + 1]) { opts.context = args[++i]; }
     else if (args[i] === "--no-record")     { opts.noRecord = true; }
     else if (args[i] === "--verbose" || args[i] === "-v") { opts.verbose = true; }
@@ -2414,6 +2552,117 @@ function exportReport(sub, bug, enforced) {
   } catch (_) {}
 }
 
+// ── count-tokens command ────────────────────────────────────────────────────
+// Reads a prompt from stdin (or --text), calls /v1/messages/count_tokens,
+// and prints measured tokens + projected cost at the requested model's rate.
+async function countTokensCmd(opts) {
+  const cfg = loadConfig();
+  if (!cfg.anthropicApiKey) {
+    console.log(`\n  ${yl("No API key configured.")} Run: claude-audit setup\n`);
+    process.exit(1);
+  }
+  const model = opts.model || "claude-sonnet-4-5";
+
+  let text = opts.text;
+  if (!text && !process.stdin.isTTY) {
+    text = await new Promise(resolve => {
+      let b = ""; process.stdin.setEncoding("utf8");
+      process.stdin.on("data", d => b += d);
+      process.stdin.on("end", () => resolve(b));
+    });
+  }
+  if (!text || !text.trim()) {
+    console.log("\n  Usage: echo 'your prompt' | claude-audit count-tokens [--model claude-opus-4-7]");
+    console.log("         claude-audit count-tokens --text 'your prompt'\n");
+    process.exit(1);
+  }
+
+  const result = await countTokens(cfg.anthropicApiKey, {
+    model,
+    messages: [{ role: "user", content: text }],
+  });
+  if (!result.ok) {
+    console.log(`\n  ${yl("count_tokens failed:")} ${result.error}\n`);
+    process.exit(1);
+  }
+
+  // Price projection at input rate (count_tokens only returns input_tokens).
+  const PRICES = {
+    "claude-opus":    { in: 15 },
+    "claude-sonnet":  { in: 3  },
+    "claude-haiku":   { in: 0.80 },
+  };
+  let inRate = 3;
+  for (const [k, v] of Object.entries(PRICES)) {
+    if (model.toLowerCase().startsWith(k)) { inRate = v.in; break; }
+  }
+  const inputCost = (result.input_tokens / 1_000_000) * inRate;
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      model, input_tokens: result.input_tokens, input_cost_usd: inputCost,
+    }));
+    return;
+  }
+  console.log("");
+  console.log(`  model:        ${bold(model)}`);
+  console.log(`  input_tokens: ${bold(String(result.input_tokens))}`);
+  console.log(`  input cost:   ${yl("$" + inputCost.toFixed(6))}  ${dim("(output not counted — count_tokens is input-only)")}`);
+  console.log("");
+}
+
+// ── cost-report command ────────────────────────────────────────────────────
+// Authoritative $ figures from the Admin API. Requires apikey_... or sk-ant-admin...
+async function costReportCmd(windowStr = "30d") {
+  const cfg = loadConfig();
+  if (!cfg.anthropicAdminKey) {
+    console.log(`\n  ${yl("No admin key configured.")} Run: claude-audit setup`);
+    console.log(`  Paste an Admin API key (apikey_... or sk-ant-admin...) when prompted.\n`);
+    process.exit(1);
+  }
+  const { hours } = parseWindow(windowStr);
+  const days = Math.max(1, Math.round(hours / 24));
+  const res = await fetchAnthropicCostReport(cfg.anthropicAdminKey, days);
+
+  console.log("");
+  console.log(bold(`  claude-audit — AUTHORITATIVE COST REPORT`));
+  console.log(`  Last ${windowStr}  |  Source: /v1/organizations/cost_report  (Anthropic Admin API)`);
+  console.log(`  ${SL}`);
+  console.log("");
+
+  if (!res.ok) {
+    console.log(`  ${yl("Error:")} ${res.error}\n`);
+    process.exit(1);
+  }
+  if (res.byDay.length === 0) {
+    console.log(`  No cost rows returned. Either no usage in window, or admin key scope excludes this org.\n`);
+    return;
+  }
+
+  const maxCost = Math.max(...res.byDay.map(d => d.cost));
+  const budget = cfg.monthlyBudget;
+  if (budget) {
+    console.log(`  Max plan budget      $${budget.toFixed(2)}/mo`);
+    console.log(`  Authoritative total  ${yl("$" + res.totalCost.toFixed(2))}`);
+    const overage = Math.max(0, res.totalCost - budget);
+    if (overage > 0) {
+      console.log(`  Overage              ${yl("$" + overage.toFixed(2))}  ${dim("← actual separate billing")}`);
+    }
+  } else {
+    console.log(`  Authoritative total  ${yl("$" + res.totalCost.toFixed(2))}`);
+  }
+  console.log("");
+  console.log(bold(`  DAILY BREAKDOWN`));
+  for (const day of res.byDay) {
+    const frac = maxCost > 0 ? day.cost / maxCost : 0;
+    const bars = "█".repeat(Math.round(frac * 30));
+    console.log(`  ${day.date}  ${bars.padEnd(30)}  $${day.cost.toFixed(2)}`);
+  }
+  console.log("");
+  console.log(dim(`  These are actual dollars billed by Anthropic — not estimated client-side.`));
+  console.log("");
+}
+
 async function menu() {
   const readline = require("readline");
 
@@ -2953,6 +3202,8 @@ function main() {
   if (opts.command === "doctor")    { doctor();    return; }
   if (opts.command === "setup")     { setup();     return; }
   if (opts.command === "billing")    { billingReport(opts.last); return; }
+  if (opts.command === "count-tokens"){ countTokensCmd({ model: opts.model, text: opts.text, json: opts.json }); return; }
+  if (opts.command === "cost-report") { costReportCmd(opts.last); return; }
   if (opts.command === "reconcile") { reconcile(opts.reconcileFile); return; }
   if (opts.command === "redundancy") { redundancyReport(opts); return; }
   if (opts.command === "gate-stats") { gateStatsCmd(); return; }
