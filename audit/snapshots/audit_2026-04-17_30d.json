@@ -1,0 +1,702 @@
+{
+  "window_days": 30,
+  "version": {
+    "git_head": "75d0f4a",
+    "audit_js_sha256_16": "19b7794de874b730",
+    "spec_md_sha256_16": "6ad46e3c9499d8c6",
+    "history_file": {
+      "bytes": 2139990,
+      "mtime": "2026-04-17T16:58:20.123Z"
+    },
+    "classifier_drift": true,
+    "utc": "2026-04-17T16:58:51.152Z"
+  },
+  "available": true,
+  "tally": {
+    "total": 4279,
+    "counts": {
+      "empty": 0,
+      "continuation": 1750,
+      "low": 151,
+      "medium": 2247,
+      "high": 131
+    },
+    "haikuEligible": 1901,
+    "haikuPct": 0.44426267819584014
+  },
+  "stable": true,
+  "probes": {
+    "falseContinuations": [],
+    "shortSubstantive": [
+      {
+        "text": "update claude.md and close auth gap",
+        "wc": 6
+      },
+      {
+        "text": "yes commit and push now",
+        "wc": 5
+      },
+      {
+        "text": "heres the test.pypi.org token e0950653-c776-4b44-b875-16bbf8ebc51d",
+        "wc": 5
+      },
+      {
+        "text": "add what helps as you said",
+        "wc": 6
+      },
+      {
+        "text": "commit and push what we have so far",
+        "wc": 8
+      },
+      {
+        "text": "check this \"C:\\Users\\Brock1\\Desktop\\To Do\\Work to do.docx\"",
+        "wc": 6
+      },
+      {
+        "text": "ok summarize status.. commit and push",
+        "wc": 6
+      },
+      {
+        "text": "yes run it against my cache right now",
+        "wc": 8
+      },
+      {
+        "text": "think of the most intelligent fix here",
+        "wc": 7
+      },
+      {
+        "text": "commit and push to preserve our progress",
+        "wc": 7
+      },
+      {
+        "text": "commit and push what we have",
+        "wc": 6
+      },
+      {
+        "text": "\"C:\\Users\\Brock1\\Desktop\\Make\\Airtable -- Make (Generate Content).blueprint.json\"",
+        "wc": 5
+      },
+      {
+        "text": "commit and push what you have",
+        "wc": 6
+      },
+      {
+        "text": "\"C:\\Users\\Brock1\\Desktop\\Make\\Airtable -- Make (Generate Content) + ENTIENT Seal.blueprint.json\"",
+        "wc": 8
+      },
+      {
+        "text": "Keep the master file here\n\nC:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md",
+        "wc": 6
+      },
+      {
+        "text": "test it to make sure",
+        "wc": 5
+      },
+      {
+        "text": "commit and push what you have then continue",
+        "wc": 8
+      },
+      {
+        "text": "commit and push what you just did",
+        "wc": 7
+      },
+      {
+        "text": "ok update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" with current status",
+        "wc": 6
+      },
+      {
+        "text": "update current status doc - \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "great for the probe bridge please update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 8
+      },
+      {
+        "text": "update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" with the lastest updates since last",
+        "wc": 8
+      },
+      {
+        "text": "update the doc with our updates at \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 8
+      },
+      {
+        "text": "great. check and answer this \"C:\\Users\\Brock1\\Desktop\\Agent\\marketplace check.txt\"",
+        "wc": 7
+      },
+      {
+        "text": "commit and push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "ok commit and push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 7
+      },
+      {
+        "text": "commit, push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "commit and push what you have",
+        "wc": 6
+      },
+      {
+        "text": "commit, push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "yeah build a panel for these.. good.",
+        "wc": 7
+      },
+      {
+        "text": "ok commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "check these issues [Pasted text #1 +34 lines]",
+        "wc": 8
+      },
+      {
+        "text": "did we commit and push our latest work?",
+        "wc": 8
+      },
+      {
+        "text": "ok commit and push yes",
+        "wc": 5
+      },
+      {
+        "text": "familiarize yoursel with project status here - \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT",
+        "wc": 8
+      },
+      {
+        "text": "get familiar with project here \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "alright commit and push is done?",
+        "wc": 6
+      },
+      {
+        "text": "commit and push it and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 7
+      },
+      {
+        "text": "review \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" for current status",
+        "wc": 5
+      },
+      {
+        "text": "commit and push if you didnt",
+        "wc": 6
+      },
+      {
+        "text": "review \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" for live status",
+        "wc": 5
+      },
+      {
+        "text": "commit push and update  \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "every hour.. clock time or run time",
+        "wc": 7
+      },
+      {
+        "text": "catch up to speed on \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "ok commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "ok update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" with the latest updates",
+        "wc": 7
+      },
+      {
+        "text": "as usual update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" after every push",
+        "wc": 7
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" for the latest status",
+        "wc": 6
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" to understand status",
+        "wc": 5
+      },
+      {
+        "text": "check this now \"C:\\Users\\Brock1\\Desktop\\Runtime\\Wrapper.txt\"  \"C:\\Users\\Brock1\\Desktop\\Runtime\\Wired",
+        "wc": 6
+      },
+      {
+        "text": "commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "yes and also check.. were receipts used?",
+        "wc": 7
+      },
+      {
+        "text": "commit paste and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "great update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" with this development",
+        "wc": 6
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" to understand session",
+        "wc": 5
+      },
+      {
+        "text": "ok commit and push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 7
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" to know status",
+        "wc": 5
+      },
+      {
+        "text": "commit push then review this \"C:\\Users\\Brock1\\Desktop\\Runtime\\veritas.txt\"",
+        "wc": 6
+      },
+      {
+        "text": "commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" with this",
+        "wc": 7
+      },
+      {
+        "text": "commit push then update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "ok get up to speed: \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\".",
+        "wc": 6
+      },
+      {
+        "text": "check for current status \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "start entient receipts then read current status \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHO",
+        "wc": 8
+      },
+      {
+        "text": "\"C:\\Users\\Brock1\\Desktop\\Runtime\\Smoke Test after Parser is Done.txt\"",
+        "wc": 6
+      },
+      {
+        "text": "\"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" read this for context",
+        "wc": 5
+      },
+      {
+        "text": "\"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" read this for context",
+        "wc": 5
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Runtime\\Smoke Test after Parser is Done.txt\"",
+        "wc": 7
+      },
+      {
+        "text": "yep commit push and update \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 6
+      },
+      {
+        "text": "add your session delta to session_deltas_recent.md",
+        "wc": 6
+      },
+      {
+        "text": "commit push and update master status",
+        "wc": 6
+      },
+      {
+        "text": "commit push and update master status",
+        "wc": 6
+      },
+      {
+        "text": "note we did add entient-ops",
+        "wc": 5
+      },
+      {
+        "text": "rename this to entient-ops?  C:\\Users\\Brock1\\Desktop\\Agent",
+        "wc": 5
+      },
+      {
+        "text": "sure if you can fix it",
+        "wc": 6
+      },
+      {
+        "text": "please read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" for project status",
+        "wc": 6
+      },
+      {
+        "text": "may have to check here too C:\\Users\\Brock1\\Desktop\\entient",
+        "wc": 7
+      },
+      {
+        "text": "learn project status here \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\"",
+        "wc": 5
+      },
+      {
+        "text": "is everything wired? do a check",
+        "wc": 6
+      },
+      {
+        "text": "ok commit push and update master status",
+        "wc": 7
+      },
+      {
+        "text": "commit push and update master status doc",
+        "wc": 7
+      },
+      {
+        "text": "commit push update master status",
+        "wc": 5
+      },
+      {
+        "text": "great commit push and update master status",
+        "wc": 7
+      },
+      {
+        "text": "ok commit push and update master status then",
+        "wc": 8
+      },
+      {
+        "text": "please read \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" for context",
+        "wc": 5
+      },
+      {
+        "text": "ok commit push and update master",
+        "wc": 6
+      },
+      {
+        "text": "yes commit push and update snapshot",
+        "wc": 6
+      },
+      {
+        "text": "cool commit push and update snapshot",
+        "wc": 6
+      },
+      {
+        "text": "check on the mining jobs",
+        "wc": 5
+      },
+      {
+        "text": "commit push and update snapshot",
+        "wc": 5
+      },
+      {
+        "text": "yes commit push and update master status",
+        "wc": 7
+      },
+      {
+        "text": "commit, push and update master status doc..",
+        "wc": 7
+      },
+      {
+        "text": "also commit and push your work",
+        "wc": 6
+      },
+      {
+        "text": "check on the entient machine learning agent",
+        "wc": 7
+      },
+      {
+        "text": "run it with checkpoint commits/saves proceed",
+        "wc": 6
+      },
+      {
+        "text": "commit push update master always",
+        "wc": 5
+      },
+      {
+        "text": "thats awesome update master, commit and push",
+        "wc": 7
+      },
+      {
+        "text": "commit push update master status doc",
+        "wc": 6
+      },
+      {
+        "text": "well commit and push and update master",
+        "wc": 7
+      },
+      {
+        "text": "what about this \"C:\\Users\\Brock1\\Desktop\\VRAM Steaming\\VRAM\\wormhole_gpu_pump.py\"",
+        "wc": 5
+      },
+      {
+        "text": "ok can you run it in parallel?",
+        "wc": 7
+      },
+      {
+        "text": "should we address this failing test at all?",
+        "wc": 8
+      },
+      {
+        "text": "re-run the compiler if we have the space",
+        "wc": 8
+      },
+      {
+        "text": "is that accurate? check master spec",
+        "wc": 6
+      },
+      {
+        "text": "yep compile then run enrichment again",
+        "wc": 6
+      },
+      {
+        "text": "ok update master, commit and push",
+        "wc": 6
+      },
+      {
+        "text": "great commit push and update master",
+        "wc": 6
+      },
+      {
+        "text": "first commit push and update master snapshot",
+        "wc": 7
+      },
+      {
+        "text": "commit and push dont want to lose anything",
+        "wc": 8
+      },
+      {
+        "text": "check on wiring.. any gaps?",
+        "wc": 5
+      },
+      {
+        "text": "is that because we're doing a training run?",
+        "wc": 8
+      },
+      {
+        "text": "great the fix worked.. whats next",
+        "wc": 6
+      },
+      {
+        "text": "and we should check.. is that system receipted?",
+        "wc": 8
+      },
+      {
+        "text": "check master status.. was that done?",
+        "wc": 6
+      },
+      {
+        "text": "check periodically to make sure this finishes",
+        "wc": 7
+      },
+      {
+        "text": "read for status C:\\Users\\Brock1\\Desktop\\Agent  \"C:\\Users\\Brock1\\Desktop\\Agent\\DESIGN_DECISIONS.md\" \"",
+        "wc": 7
+      },
+      {
+        "text": "read for context \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAPSHOT.md\" \"C:\\Users\\Brock1\\Desktop\\",
+        "wc": 7
+      },
+      {
+        "text": "is there anyway to check eta",
+        "wc": 6
+      },
+      {
+        "text": "is there anyway to check eta?",
+        "wc": 6
+      },
+      {
+        "text": "this i s the one to test",
+        "wc": 7
+      },
+      {
+        "text": "commit push and update master snapshot?",
+        "wc": 6
+      },
+      {
+        "text": "mastern snapshot updated and claude.md if needed?",
+        "wc": 7
+      },
+      {
+        "text": "update claude.md, master snapshot, design doc if needed",
+        "wc": 8
+      },
+      {
+        "text": "commit push update necessary docs",
+        "wc": 5
+      },
+      {
+        "text": "read \"C:\\Users\\Brock1\\Desktop\\Agent\\CLAUDE.md\" and \"C:\\Users\\Brock1\\Desktop\\Agent\\MASTER_STATUS_SNAP",
+        "wc": 7
+      },
+      {
+        "text": "fix this [Pasted text #1 +70 lines]",
+        "wc": 7
+      },
+      {
+        "text": "see our project here \"C:\\Users\\Brock1\\Desktop\\Agent\\CLAUDE.md\"",
+        "wc": 5
+      },
+      {
+        "text": "also read \"C:\\Users\\Brock1\\Desktop\\Agent\\CLAUDE.md\" and  \"C:\\Users\\Brock1\\Desktop\\Agent\\SYNTHESIS_SO",
+        "wc": 5
+      },
+      {
+        "text": "this will also help \"C:\\Users\\Brock1\\Desktop\\Agent\\SYNTHESIS_SOP.md\"",
+        "wc": 5
+      },
+      {
+        "text": "check stale huds they're frequently a problem",
+        "wc": 7
+      },
+      {
+        "text": "yes delete  them, recover the space",
+        "wc": 6
+      },
+      {
+        "text": "check out claude.md we need to resume waves",
+        "wc": 8
+      },
+      {
+        "text": "please review claude.md master status and \"C:\\Users\\Brock1\\Desktop\\Agent\\DESIGN_DECISIONS.md\"",
+        "wc": 7
+      },
+      {
+        "text": "ok lets test it.. PAUSE",
+        "wc": 5
+      },
+      {
+        "text": "capture this commit and push and document thoroughly",
+        "wc": 8
+      },
+      {
+        "text": "should we run a real traffic test",
+        "wc": 7
+      },
+      {
+        "text": "ok commit push update docs",
+        "wc": 5
+      },
+      {
+        "text": "run additional waves here then",
+        "wc": 5
+      },
+      {
+        "text": "ok double check its pacing",
+        "wc": 5
+      },
+      {
+        "text": "ok commit and push if you didnt",
+        "wc": 7
+      },
+      {
+        "text": "check current status in agent folder",
+        "wc": 6
+      },
+      {
+        "text": "its easy to forget. fix it",
+        "wc": 6
+      },
+      {
+        "text": "what dependencies needed to run?",
+        "wc": 5
+      },
+      {
+        "text": "check claude.md and our recent  project status",
+        "wc": 7
+      },
+      {
+        "text": "can you activate and run it now? eta?",
+        "wc": 8
+      },
+      {
+        "text": "ok so you did commit and push",
+        "wc": 7
+      },
+      {
+        "text": "definitely commit and push this work",
+        "wc": 6
+      },
+      {
+        "text": "— post-fix pass has zero.",
+        "wc": 5
+      },
+      {
+        "text": "commit the plan and begin",
+        "wc": 5
+      },
+      {
+        "text": "how will we know its time to check",
+        "wc": 8
+      },
+      {
+        "text": "go and and commit this work then continue",
+        "wc": 8
+      },
+      {
+        "text": "well fix it if its fast",
+        "wc": 6
+      },
+      {
+        "text": "ok commit and push your changes",
+        "wc": 6
+      },
+      {
+        "text": "commit push and document well",
+        "wc": 5
+      }
+    ]
+  },
+  "sample": {
+    "file": "C:\\Users\\Brock1\\Desktop\\entient-gateway\\audit\\samples\\sample_2026-04-17_30d.jsonl",
+    "created": false
+  },
+  "agreement": {
+    "count": 50,
+    "overall": 0.94,
+    "perClass": {
+      "empty": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": null,
+        "recall": null
+      },
+      "continuation": {
+        "tp": 22,
+        "fp": 3,
+        "fn": 0,
+        "precision": 0.88,
+        "recall": 1
+      },
+      "low": {
+        "tp": 5,
+        "fp": 0,
+        "fn": 2,
+        "precision": 1,
+        "recall": 0.7142857142857143
+      },
+      "medium": {
+        "tp": 20,
+        "fp": 0,
+        "fn": 1,
+        "precision": 1,
+        "recall": 0.9523809523809523
+      },
+      "high": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": null,
+        "recall": null
+      }
+    }
+  },
+  "verdict": {
+    "ok_to_cite": true,
+    "blockers": []
+  }
+}

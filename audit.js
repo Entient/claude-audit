@@ -1014,19 +1014,38 @@ function status() {
 
 // ── Analytics (original report) ─────────────────────────────────────────────
 
+// Classifier v2 (2026-04-17) — mirror in audit/run_audit.js and bump AUDIT_SPEC.md.
+// v1 over-called "continuation" via ACK prefix ("ok but I want to...") and
+// under-called "low" because LOW_RE vocab was too narrow. v2 strips a leading
+// ACK ("ok,"/"good"/"sure",...) before the lookup check and requires word count
+// ≤ SHORT_ACK on the stripped remainder for continuation.
 const CONTINUATION_RE = /^(proceed|continue|do it|go ahead|yes|no|ok|good|both|all|now do|next|great|sounds|done|sure|right|correct|perfect|got it|makes sense|agreed)\b/i;
+const ACK_PREFIX_RE   = /^(ok|yeah|yes|no|sure|good|great|alright|perfect|right|cool|nice|got it)[,.:\s]+/i;
 const SHORT_ACK       = 8;
 const HIGH_RE         = /traceback|error:|exception:|nameerror|typeerror|assertionerror|```|architect|implement|refactor|generate code|write.*test|update.*spec/i;
-const LOW_RE          = /^(where is|what is|what are|what was|did you|does the|how do|can you show|rename it|it wasn.t)/i;
+const LOW_RE          = /^(where is|what is|what are|what was|whats|did you|do we|do i|does the|does it|how do|how many|can you show|rename it|it wasn.t)\b/i;
+const LOW_MAX_WORDS   = 15;
+
+function stripAckPrefix(t) {
+  let core = t;
+  for (let i = 0; i < 2; i++) {
+    const s = core.replace(ACK_PREFIX_RE, "");
+    if (s === core) break;
+    core = s;
+  }
+  return core;
+}
 
 function classifyPromptComplexity(text) {
   const t = (text || "").trim();
   if (!t) return "empty";
-  const wordCount = t.split(/\s+/).length;
-  const hasHigh = HIGH_RE.test(t);
-  if (hasHigh) return "high";
-  if (CONTINUATION_RE.test(t) || (!hasHigh && wordCount <= SHORT_ACK)) return "continuation";
-  if (LOW_RE.test(t)) return "low";
+  if (HIGH_RE.test(t)) return "high";
+  const core = stripAckPrefix(t);
+  const wc = core.split(/\s+/).length;
+  // `low` is a narrow lookup — cap word count so multi-part questions that
+  // happen to start "do i have to ..." fall through to medium.
+  if (LOW_RE.test(core) && wc <= LOW_MAX_WORDS) return "low";
+  if (wc <= SHORT_ACK) return "continuation";
   return "medium";
 }
 
