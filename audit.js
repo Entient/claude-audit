@@ -660,8 +660,9 @@ function hookPrompt() {
   const w = computeWasteFactor(file, cfg);
   if (!w) { process.exit(0); }
 
-  // Warning-light banner (stdout). Suppressed on block path so the block
-  // decision JSON remains the only stdout payload Claude Code sees.
+  // Warning-light banner (stderr — the user-visible hook channel in Claude Code).
+  // Suppressed when we're about to emit a block-decision JSON so the user sees
+  // the full block banner instead of a redundant one-line warning beforehand.
   const willBlock = w.blocked && cfg.mode !== "shadow" && !process.env.ENTIENT_SPEND_SKIP;
   if (!willBlock) emitWarningLight(file);
 
@@ -1460,7 +1461,8 @@ function emitWarningLight(sessionFile) {
       st._ts = Date.now();
       all[sid] = st;
       _saveFireState(all);
-      process.stdout.write(line + "\n");
+      // stderr = user-visible channel in Claude Code (matches existing waste-factor warnings).
+      process.stderr.write(line + "\n");
     }
   } catch (_) { /* fail silent */ }
 }
