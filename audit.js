@@ -48,6 +48,7 @@ const LAST_SESSION    = path.join(AUDIT_DIR, "last-session.md");
 const RESTART_FLAG    = path.join(AUDIT_DIR, "restart-flag");   // watched by claude-loop
 const CONFIG_FILE     = path.join(AUDIT_DIR, "config.json");
 const SHADOW_LOG      = path.join(AUDIT_DIR, "shadow_log.jsonl");
+const FIRE_STATE_FILE = path.join(AUDIT_DIR, "session-fire-state.json");
 const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
@@ -620,6 +621,11 @@ function hookPrompt() {
 
   const w = computeWasteFactor(file, cfg);
   if (!w) { process.exit(0); }
+
+  // Warning-light banner (stdout). Suppressed on block path so the block
+  // decision JSON remains the only stdout payload Claude Code sees.
+  const willBlock = w.blocked && cfg.mode !== "shadow" && !process.env.ENTIENT_SPEND_SKIP;
+  if (!willBlock) emitWarningLight(file);
 
   // Early warning: approaching threshold — run git savepoint now while Claude
   // is still alive and can finish any in-progress task cleanly.
@@ -1297,6 +1303,128 @@ function priceForModel(modelStr) {
 function tokCost(p, inp, out, cc, cr) {
   return (inp / 1e6 * p.in) + (out / 1e6 * p.out) +
          (cc  / 1e6 * p.cacheCreate) + (cr / 1e6 * p.cacheRead);
+}
+
+// ── Warning-light banner (v1: edge-triggered, max 3 fires per session) ──────
+// Fire 1: session cost crosses $5  (warn)
+// Fire 2: session cost crosses $10 (alarm)
+// Fire 3: model tier bumps upward mid-session (haiku<sonnet<opus), once
+// State persisted at FIRE_STATE_FILE, keyed by CLAUDE_SESSION_ID.
+// Fail-silent: any error returns without writing stdout.
+
+function _modelTier(modelStr) {
+  if (!modelStr) return 0;
+  const m = modelStr.toLowerCase();
+  if (m.includes("opus"))   return 3;
+  if (m.includes("sonnet")) return 2;
+  if (m.includes("haiku"))  return 1;
+  return 0;
+}
+
+function _tierName(tier) {
+  return ({1:"Haiku",2:"Sonnet",3:"Opus"})[tier] || "?";
+}
+
+function _readSessionTurnsPriced(sessionFile) {
+  if (!fs.existsSync(sessionFile)) return [];
+  const turns = [];
+  let cur = null;
+  try {
+    const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let rec; try { rec = JSON.parse(line); } catch (_) { continue; }
+      const type = rec.type || (rec.message && rec.message.role);
+      if (type === "user" || rec.message?.role === "user") {
+        if (cur) turns.push(cur);
+        cur = { model: null, inp: 0, out: 0, cc: 0, cr: 0 };
+      }
+      if ((type === "assistant" || rec.message?.role === "assistant") && cur) {
+        const u = rec.message?.usage || rec.usage || {};
+        cur.model = rec.message?.model || rec.model || cur.model;
+        cur.inp += u.input_tokens || 0;
+        cur.out += u.output_tokens || 0;
+        cur.cc  += u.cache_creation_input_tokens || 0;
+        cur.cr  += u.cache_read_input_tokens || 0;
+      }
+    }
+    if (cur && (cur.inp + cur.out + cur.cc + cur.cr) > 0) turns.push(cur);
+  } catch (_) {}
+  return turns.filter(t => t.model);
+}
+
+function _sessionCostUSD(turns) {
+  let total = 0;
+  for (const t of turns) {
+    const p = priceForModel(t.model);
+    total += tokCost(p, t.inp, t.out, t.cc, t.cr);
+  }
+  return total;
+}
+
+function _loadFireState() {
+  try {
+    if (!fs.existsSync(FIRE_STATE_FILE)) return {};
+    const parsed = JSON.parse(fs.readFileSync(FIRE_STATE_FILE, "utf8"));
+    return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
+  } catch (_) { return {}; }
+}
+
+function _saveFireState(all) {
+  try {
+    ensureAuditDir();
+    const tmp = FIRE_STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(all));
+    fs.renameSync(tmp, FIRE_STATE_FILE);
+  } catch (_) {}
+}
+
+function _pruneFireState(all) {
+  const now = Date.now(), TTL = 48 * 3600 * 1000;
+  for (const sid of Object.keys(all)) {
+    if (now - (all[sid]._ts || 0) > TTL) delete all[sid];
+  }
+  return all;
+}
+
+function emitWarningLight(sessionFile) {
+  try {
+    const sid = process.env.CLAUDE_SESSION_ID;
+    if (!sid) return;
+    const turns = _readSessionTurnsPriced(sessionFile);
+    if (!turns.length) return;
+
+    const cost = _sessionCostUSD(turns);
+    const firstTier = _modelTier(turns[0].model);
+    let maxTier = firstTier;
+    for (const t of turns) {
+      const tier = _modelTier(t.model);
+      if (tier > maxTier) maxTier = tier;
+    }
+
+    const all = _pruneFireState(_loadFireState());
+    const st = all[sid] || { warn5: false, alarm10: false, bump: false, _ts: Date.now() };
+
+    let line = null;
+    if (!st.alarm10 && cost >= 10) {
+      line = `SPEND⛔ session $${cost.toFixed(2)} (alarm)`;
+      st.alarm10 = true;
+      st.warn5   = true; // suppress warn if we crossed both in one step
+    } else if (!st.warn5 && cost >= 5) {
+      line = `SPEND⚠ session $${cost.toFixed(2)} (warn)`;
+      st.warn5 = true;
+    } else if (!st.bump && maxTier > firstTier && firstTier > 0) {
+      line = `SPEND⚠ model bumped ${_tierName(firstTier)}→${_tierName(maxTier)}`;
+      st.bump = true;
+    }
+
+    if (line) {
+      st._ts = Date.now();
+      all[sid] = st;
+      _saveFireState(all);
+      process.stdout.write(line + "\n");
+    }
+  } catch (_) { /* fail silent */ }
 }
 
 /**
