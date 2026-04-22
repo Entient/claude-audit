@@ -664,7 +664,7 @@ function hookPrompt() {
   // Suppressed when we're about to emit a block-decision JSON so the user sees
   // the full block banner instead of a redundant one-line warning beforehand.
   const willBlock = w.blocked && cfg.mode !== "shadow" && !process.env.ENTIENT_SPEND_SKIP;
-  if (!willBlock) emitWarningLight(file);
+  if (!willBlock) emitWarningLight(file, w);
 
   // Early warning: approaching threshold — run git savepoint now while Claude
   // is still alive and can finish any in-progress task cleanly.
@@ -1426,7 +1426,7 @@ function _pruneFireState(all) {
   return all;
 }
 
-function emitWarningLight(sessionFile) {
+function emitWarningLight(sessionFile, w) {
   try {
     const sid = currentSessionId();
     if (!sid) return;
@@ -1442,7 +1442,7 @@ function emitWarningLight(sessionFile) {
     }
 
     const all = _pruneFireState(_loadFireState());
-    const st = all[sid] || { warn5: false, alarm10: false, bump: false, _ts: Date.now() };
+    const st = all[sid] || { warn5: false, alarm10: false, bump: false, waste2: false, waste3: false, _ts: Date.now() };
 
     let line = null;
     if (!st.alarm10 && cost >= 10) {
@@ -1452,6 +1452,13 @@ function emitWarningLight(sessionFile) {
     } else if (!st.warn5 && cost >= 5) {
       line = `SPEND⚠ session $${cost.toFixed(2)} (warn)`;
       st.warn5 = true;
+    } else if (w && !st.waste3 && w.factor >= 3) {
+      line = `SPEND⚠ session ${w.factor}x waste after ${w.turns} turns`;
+      st.waste3 = true;
+      st.waste2 = true; // suppress waste2 if we crossed both in one step
+    } else if (w && !st.waste2 && w.factor >= 2) {
+      line = `SPEND⚠ session ${w.factor}x waste after ${w.turns} turns`;
+      st.waste2 = true;
     } else if (!st.bump && maxTier > firstTier && firstTier > 0) {
       line = `SPEND⚠ model bumped ${_tierName(firstTier)}→${_tierName(maxTier)}`;
       st.bump = true;
