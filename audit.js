@@ -495,10 +495,39 @@ function avg(arr) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-/** Find the JSONL file for the current session from env vars. */
+/**
+ * Read Claude Code's hook JSON payload from stdin, once, cached.
+ * Claude Code pipes { session_id, transcript_path, cwd, hook_event_name, ... }
+ * as JSON on stdin for every hook invocation. Returns parsed object or null.
+ * Guarded against interactive (TTY) stdin so CLI invocations don't block.
+ */
+let _cachedHookInput = undefined;
+function readHookInput() {
+  if (_cachedHookInput !== undefined) return _cachedHookInput;
+  _cachedHookInput = null;
+  try {
+    if (process.stdin.isTTY) return null;
+    const raw = fs.readFileSync(0, "utf8");
+    if (raw && raw.trim()) _cachedHookInput = JSON.parse(raw);
+  } catch (_) {}
+  return _cachedHookInput;
+}
+
+/** Find the JSONL file for the current session.
+ *  Prefers transcript_path from Claude Code's stdin hook payload (real contract);
+ *  falls back to CLAUDE_SESSION_ID env + PROJECTS_DIR walk.
+ */
 function currentSessionFile() {
-  const sessionId  = process.env.CLAUDE_SESSION_ID;
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const hi = readHookInput();
+
+  // 1. Claude Code's real contract: transcript_path points directly at the JSONL.
+  if (hi && typeof hi.transcript_path === "string" && fs.existsSync(hi.transcript_path)) {
+    return hi.transcript_path;
+  }
+
+  // 2. Fall back to env + sid walk (kept for shells that set CLAUDE_SESSION_ID).
+  const sessionId  = process.env.CLAUDE_SESSION_ID || (hi && hi.session_id) || null;
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || (hi && hi.cwd) || process.cwd();
 
   if (!sessionId || !fs.existsSync(PROJECTS_DIR)) return null;
 
@@ -517,6 +546,15 @@ function currentSessionFile() {
     if (fs.existsSync(f)) return f;
   }
   return null;
+}
+
+/** Resolve the current session id (for keying fire-state, shadow log, etc.)
+ *  Prefers stdin payload, then env, then null. Must be called after
+ *  readHookInput has had a chance to cache (or inside a hook path).
+ */
+function currentSessionId() {
+  const hi = readHookInput();
+  return (hi && hi.session_id) || process.env.CLAUDE_SESSION_ID || null;
 }
 
 // ── Hook handlers ────────────────────────────────────────────────────────────
@@ -1389,7 +1427,7 @@ function _pruneFireState(all) {
 
 function emitWarningLight(sessionFile) {
   try {
-    const sid = process.env.CLAUDE_SESSION_ID;
+    const sid = currentSessionId();
     if (!sid) return;
     const turns = _readSessionTurnsPriced(sessionFile);
     if (!turns.length) return;
