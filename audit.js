@@ -837,9 +837,19 @@ function _sessionStartTs(sessionFile) {
   return null;
 }
 
-function _readSessionSavings(sinceTs) {
+function _readSessionSavings(sinceTs, sessionId) {
   // Sum deflect_measured (precise) + deflect (estimated). Mirrors the
   // measurement-vs-rule-of-thumb split used by the full billing report.
+  //
+  // sessionId scoping: if provided, count only events whose data.session_id
+  // matches. Without this filter, two concurrent Claude Code sessions each
+  // see the other's deflects (timestamp alone is not a session boundary).
+  // Deflect writers already stamp session_id on every record (verified in
+  // ENTIENT_GOV_LOG inspection 2026-04-23). Events missing session_id are
+  // excluded when a sessionId is provided — fail-closed on this axis so
+  // multi-session accounting can't double-count stale schemas.
+  // sessionId=null preserves the pre-fix semantic for callers that really
+  // do want cross-session sums (the full billing report, etc.).
   if (!sinceTs) return { usd: 0, count: 0, measured: false };
   const raw = tailBytes(ENTIENT_GOV_LOG, 4 * 1024 * 1024);
   if (!raw) return { usd: 0, count: 0, measured: false };
@@ -850,8 +860,9 @@ function _readSessionSavings(sinceTs) {
     if (!line) continue;
     let rec; try { rec = JSON.parse(line); } catch (_) { continue; }
     if (typeof rec.ts !== "number" || rec.ts < sinceTs) continue;
+    const d = rec.data || {};
+    if (sessionId != null && d.session_id !== sessionId) continue;
     if (rec.type === "deflect_measured") {
-      const d = rec.data || {};
       if (d.status === "ok") {
         usd += d.input_cost_usd_avoided || 0;
         measuredHits++;
@@ -926,7 +937,7 @@ function hookStatus() {
     const cost = priced.length ? _sessionCostUSD(priced) : 0;
     const turnsN = w ? w.turns : priced.length;
     const sinceTs = _sessionStartTs(file);
-    const saved = _readSessionSavings(sinceTs);
+    const saved = _readSessionSavings(sinceTs, currentSessionId());
     const risk = _riskState(w ? w.factor : null, cost, cfg);
 
     // Billing mode: subscription users (Pro/Max — the default for Claude Code)
@@ -3365,8 +3376,10 @@ print(json.dumps([{'date':r[0],'model':r[1],'tokens':r[2],'cost':r[3],'calls':r[
 //   ~/.entient/forwards/forwards.jsonl             — intake pipeline
 // Customer-framed output: inferences deferred, tokens saved, $ saved, session waste factor.
 
-const ENTIENT_GOV_LOG  = path.join(os.homedir(), ".entient", "governance", "governance_events.jsonl");
-const ENTIENT_FWD_LOG  = path.join(os.homedir(), ".entient", "forwards", "forwards.jsonl");
+// Env overrides enable testing against a fake governance log without
+// touching real data. CLI and hook paths use the defaults in production.
+const ENTIENT_GOV_LOG  = process.env.ENTIENT_GOV_LOG  || path.join(os.homedir(), ".entient", "governance", "governance_events.jsonl");
+const ENTIENT_FWD_LOG  = process.env.ENTIENT_FWD_LOG  || path.join(os.homedir(), ".entient", "forwards", "forwards.jsonl");
 const ENTIENT_PID_FILE = path.join(os.homedir(), ".entient", "watcher.pid");
 const AVG_TOKENS_PER_INFERENCE = 1500;   // conservative rule-of-thumb for deferral value
 const AVG_USD_PER_INFERENCE    = 0.008;  // sonnet-ish blended rate on 1.5k tokens
@@ -3660,4 +3673,15 @@ function main() {
   menu().catch(e => { console.error(e.message); process.exit(1); });
 }
 
-main();
+// Test-only export surface. Guarded on require.main so CLI invocation is
+// unchanged (node audit.js / entient-spend bin still run main()). External
+// imports (tests, tooling) get the internal functions without side effects.
+if (require.main === module) {
+  main();
+} else {
+  module.exports = {
+    _readSessionSavings,
+    currentSessionId,
+    AVG_USD_PER_INFERENCE,
+  };
+}
