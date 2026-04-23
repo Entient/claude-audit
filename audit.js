@@ -929,42 +929,62 @@ function hookStatus() {
     const saved = _readSessionSavings(sinceTs);
     const risk = _riskState(w ? w.factor : null, cost, cfg);
 
-    // Silence floor: no spend AND no value yet → nothing to surface.
-    if (cost < 0.50 && saved.usd < 0.10) { process.exit(0); }
+    // Billing mode: subscription users (Pro/Max — the default for Claude Code)
+    // are NOT charged per-token; showing $ would misrepresent their bill.
+    // `api` mode flips to dollar display for direct-API users via env override.
+    const billing = (process.env.ENTIENT_SPEND_BILLING || "subscription").toLowerCase();
+    const showDollars = billing === "api";
 
-    // ── Line 1: spend + severity (icon-only state, no redundant word) ────────
-    const parts1 = [`$${cost.toFixed(2)}`];
-    if (w && risk.word !== "ok") parts1.push(`${risk.icon} ${w.factor}×`);
-    else if (risk.word !== "ok")  parts1.push(`${risk.icon}`);
+    // Silence floor: nothing risky AND no value → don't pollute the bar.
+    const quiet = risk.word === "ok" && saved.count === 0 && turnsN < 30;
+    if (quiet) { process.exit(0); }
+
+    // ── Line 1: trajectory ───────────────────────────────────────────────────
+    // Subscription: ⛔ 4× burn · 128t   (icon + waste + turns; no $)
+    // API mode:      $197.16 · ⛔ 4× · 128t
+    const parts1 = [];
+    if (showDollars) parts1.push(`$${cost.toFixed(2)}`);
+    if (w && risk.word !== "ok") parts1.push(`${risk.icon} ${w.factor}× burn`);
+    else if (w)                  parts1.push(`${w.factor}× burn`);
+    parts1.push(`${turnsN}t`);
     let line1 = parts1.join(" · ");
 
-    // ── Line 2: value returned (the customer-facing answer) ─────────────────
+    // ── Line 2: value returned ──────────────────────────────────────────────
+    // Subscription: count of skipped LLM calls (the real value to a Pro user).
+    // API mode:      adds the $-equivalent. Always tagged ~est unless measured.
     let line2;
     if (saved.count > 0) {
-      const noun = saved.count === 1 ? "reused action" : "reused actions";
-      const measuredTag = saved.measured ? "" : "  ~est";
-      line2 = `saved $${saved.usd.toFixed(2)} · ${saved.count} ${noun}${measuredTag}`;
+      const noun = saved.count === 1 ? "LLM call skipped" : "LLM calls skipped";
+      if (showDollars) {
+        const tag = saved.measured ? "" : " ~est";
+        line2 = `saved $${saved.usd.toFixed(2)}${tag} · ${saved.count} ${noun}`;
+      } else {
+        line2 = `${saved.count} ${noun}`;
+      }
     } else {
-      line2 = "monitoring only · no savings yet";
+      line2 = "monitoring only · no skipped calls yet";
     }
 
     // ── Variants ─────────────────────────────────────────────────────────────
     if (mode === "minimal") {
-      const mini = [`$${cost.toFixed(2)}`];
+      const mini = [];
+      if (showDollars) mini.push(`$${cost.toFixed(2)}`);
       if (w && risk.word !== "ok") mini.push(`${risk.icon} ${w.factor}×`);
-      if (saved.count > 0) mini.push(`saved $${saved.usd.toFixed(2)}`);
+      else if (w)                  mini.push(`${w.factor}×`);
+      mini.push(`${turnsN}t`);
+      if (saved.count > 0) mini.push(`${saved.count} skipped`);
       process.stdout.write(mini.join(" · "));
       process.exit(0);
     }
 
     if (mode === "debug") {
-      // Internal HUD only in debug — keeps default path Python-free.
       const cache = _readHudCache();
       if (!cache.fresh) _refreshHudCacheAsync();
       const top = cache.data && cache.data.top;
       const cacheTag = cache.data ? `cache=${Math.floor(cache.ageS)}s` : "cache=cold";
-      const modeTag = `mode=${cfg.mode || "enforce"}`;
-      line1 += ` · ${turnsN}t · ${modeTag}`;
+      const billTag = `bill=${billing}`;
+      const apiEquiv = `~$${cost.toFixed(2)} api-equiv`;
+      line1 += ` · ${apiEquiv} · ${billTag}`;
       if (top) {
         const tag = top.blocked_kind ? `${top.tag}:${top.blocked_kind}` : top.tag;
         line2 += ` | ${tag} ${top.name} → ${_shortAction(top.next_action)}`;
