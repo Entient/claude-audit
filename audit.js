@@ -53,14 +53,42 @@ const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
 
-// Canonical pressure-signal artifact consumed by Agent/continuation_policy.py.
+// Canonical pressure-signal artifact directory consumed by
+// Agent/continuation_policy.py.  Per-session partition: one file per claude
+// session_id at PRESSURE_SIGNAL_DIR/<session_id>.json.  Eliminates cross-
+// window last-writer-wins collisions
+// (pm/CP_FIRST_OBSERVATION_FINDINGS_2026-04-23.md).
 // See pm/CONTINUATION_POLICY.md §"Pressure-signal contract" for the wire format.
-// Single file, overwritten on each emit. No DB. No history (emission log on
-// the consumer side captures state transitions; this file is a live snapshot).
-const ENTIENT_V2_DIR  = path.join(os.homedir(), ".entient", "v2");
-const PRESSURE_SIGNAL = path.join(ENTIENT_V2_DIR, "spend_pressure.json");
-const PRESSURE_SCHEMA = "spend_pressure_v1";
-const PRESSURE_TTL_S  = 300;   // 5 min — consumer rejects older artifacts
+// No DB. No history (emission log on the consumer side captures state
+// transitions; these files are live per-session snapshots).
+const ENTIENT_V2_DIR      = path.join(os.homedir(), ".entient", "v2");
+const PRESSURE_SIGNAL_DIR = path.join(ENTIENT_V2_DIR, "spend_pressure");
+const PRESSURE_SCHEMA     = "spend_pressure_v1";
+const PRESSURE_TTL_S      = 300;   // 5 min — consumer rejects older artifacts
+
+/** Derive the partitioned artifact path for a given session_id. */
+function pressureSignalPath(sessionId) {
+  return path.join(PRESSURE_SIGNAL_DIR, `${sessionId}.json`);
+}
+
+/**
+ * Best-effort sweep of pressure files older than 2*TTL by mtime.  Called
+ * after every successful emit.  Never throws — any error is swallowed so
+ * sweep failures cannot block producer output.
+ */
+function sweepStalePressureFiles() {
+  try {
+    if (!fs.existsSync(PRESSURE_SIGNAL_DIR)) return;
+    const cutoffMs = Date.now() - 2 * PRESSURE_TTL_S * 1000;
+    for (const name of fs.readdirSync(PRESSURE_SIGNAL_DIR)) {
+      const p = path.join(PRESSURE_SIGNAL_DIR, name);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs < cutoffMs) fs.unlinkSync(p);
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
 
 const DEFAULTS = {
   threshold:      5,   // context-growth factor that triggers session kill + restart (5x = each turn costs 5x session start)
@@ -1136,7 +1164,7 @@ function hookStatus() {
 
     // ── Emit pressure-signal artifact as a side effect of render.  This is
     //    the Level-1 producer half of the Continuation Policy loop (Agent-
-    //    side consumer reads ~/.entient/v2/spend_pressure.json).  Fail-safe:
+    //    side consumer reads ~/.entient/v2/spend_pressure/<session_id>.json).  Fail-safe:
     //    emit errors do not affect HUD output.  See pm/CONTINUATION_POLICY.md.
     try { emitPressureSignal(file, w, cacheReadPct); } catch (_) {}
 
@@ -1350,10 +1378,11 @@ function getHeadCommitSubject(dir) {
 }
 
 // ── Pressure-signal producer ─────────────────────────────────────────────────
-// Writes ~/.entient/v2/spend_pressure.json — the single canonical artifact
-// consumed by Agent/continuation_policy.py::read_pressure_signal.  Invariant:
-// this is the ONLY producer of that file.  Agent-side CP consults no other
-// source for pressure-driven decisions.  Schema frozen at v1.  No DB.
+// Writes ~/.entient/v2/spend_pressure/<session_id>.json — the canonical
+// per-session partitioned artifact consumed by
+// Agent/continuation_policy.py::read_pressure_signal.  Invariant: this is
+// the ONLY producer of those files.  Agent-side CP consults no other source
+// for pressure-driven decisions.  Schema frozen at v1.  No DB.
 
 let _cachedProducerVersion = null;
 function _producerVersion() {
@@ -1424,12 +1453,17 @@ function emitPressureSignal(sessionFile, w, cacheReadPct) {
   try {
     const payload = buildPressurePayload(sessionFile, w, cacheReadPct);
     if (!payload) return { ok: false, error: "no_payload:below_minTurns" };
+    if (!payload.session_id) {
+      return { ok: false, error: "no_session_id:cannot_partition" };
+    }
 
-    fs.mkdirSync(ENTIENT_V2_DIR, { recursive: true });
-    const tmp = PRESSURE_SIGNAL + ".tmp";
+    fs.mkdirSync(PRESSURE_SIGNAL_DIR, { recursive: true });
+    const target = pressureSignalPath(payload.session_id);
+    const tmp = target + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
-    fs.renameSync(tmp, PRESSURE_SIGNAL);
-    return { ok: true, path: PRESSURE_SIGNAL, payload };
+    fs.renameSync(tmp, target);
+    sweepStalePressureFiles();
+    return { ok: true, path: target, payload };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
@@ -1471,7 +1505,7 @@ function emitPressureCmd(sessionFileArg) {
 
   const res = emitPressureSignal(sessionFile, w, cacheReadPct);
   if (res.ok) {
-    console.log(`Emitted ${PRESSURE_SIGNAL}`);
+    console.log(`Emitted ${res.path}`);
     console.log(JSON.stringify(res.payload, null, 2));
     process.exit(0);
   } else {
@@ -4295,7 +4329,9 @@ if (require.main === module) {
     _readinessCheck,
     buildPressurePayload,
     emitPressureSignal,
-    PRESSURE_SIGNAL,
+    pressureSignalPath,
+    sweepStalePressureFiles,
+    PRESSURE_SIGNAL_DIR,
     PRESSURE_SCHEMA,
     PRESSURE_TTL_S,
   };
