@@ -4,20 +4,20 @@
  *
  * Two modes:
  *   1. REPORT   — reads ~/.claude and shows where quota went (no hooks needed)
- *   2. ENFORCE  — registers hooks that block sessions when waste factor gets too high
+ *   2. ENFORCE  — registers hooks that block sessions when context growth factor gets too high
  *
  * Usage:
  *   entient-spend                        # waste report (last 7d)
  *   entient-spend --last 30d
- *   entient-spend install                # register enforcement hooks (blocks at 10x waste)
+ *   entient-spend install                # register enforcement hooks (blocks at 10x context growth)
  *   entient-spend install --shadow       # register hooks in observe-only mode (warn, never block)
  *   entient-spend uninstall              # remove hooks
- *   entient-spend status                 # show hook status + current waste factor
+ *   entient-spend status                 # show hook status + current context growth factor
  *   entient-spend --json                 # machine-readable report
  *
  *   # Hook modes (called by Claude Code, not users):
- *   entient-spend --hook prompt          # UserPromptSubmit — block if waste too high
- *   entient-spend --hook tool            # PostToolUse — block autonomous work if waste high
+ *   entient-spend --hook prompt          # UserPromptSubmit — block if context growth too high
+ *   entient-spend --hook tool            # PostToolUse — block autonomous work if context growth high
  *   entient-spend --hook compact         # PreCompact — save session state
  *   entient-spend --hook start           # SessionStart — inject saved context
  *
@@ -54,8 +54,8 @@ const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
 
 const DEFAULTS = {
-  threshold:      5,   // waste factor that triggers session kill + restart (5x = each turn costs 5x session start)
-  saveThreshold:  3,   // waste factor that triggers git savepoint + warning (early signal)
+  threshold:      5,   // context-growth factor that triggers session kill + restart (5x = each turn costs 5x session start)
+  saveThreshold:  3,   // context-growth factor that triggers git savepoint + warning (early signal)
   minTurns:      15,   // minimum turns before enforcing
   baselineTurns:  5,   // turns used to establish baseline
   windowTurns:    5,   // turns used for current average
@@ -469,7 +469,53 @@ function readSessionTurns(sessionFile) {
 }
 
 /**
- * Compute waste factor for a session file.
+ * Like readSessionTurns but preserves the four API usage fields separately
+ * per turn (input / cache_creation / cache_read / output) so downstream code
+ * can reconcile formula choices. readSessionTurns collapses to totalTokens.
+ */
+function readSessionTurnsRaw(sessionFile) {
+  if (!fs.existsSync(sessionFile)) return [];
+
+  const turns = [];
+  let cur = null;
+  let firstTs = null, lastTs = null;
+
+  try {
+    const lines = fs.readFileSync(sessionFile, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let rec; try { rec = JSON.parse(line); } catch (_) { continue; }
+
+      const ts = rec.timestamp || rec.message?.timestamp || null;
+      if (ts) { if (!firstTs) firstTs = ts; lastTs = ts; }
+
+      const role = rec.type || (rec.message && rec.message.role);
+      if (role === "user" || rec.message?.role === "user") {
+        if (cur) turns.push(cur);
+        cur = { inp: 0, cc: 0, cr: 0, out: 0 };
+      }
+      if ((role === "assistant" || rec.message?.role === "assistant") && cur) {
+        const u = rec.message?.usage || rec.usage || {};
+        cur.inp += u.input_tokens                || 0;
+        cur.cc  += u.cache_creation_input_tokens || 0;
+        cur.cr  += u.cache_read_input_tokens     || 0;
+        cur.out += u.output_tokens               || 0;
+      }
+    }
+    if (cur && (cur.inp + cur.cc + cur.cr + cur.out) > 0) turns.push(cur);
+  } catch (_) {}
+
+  const nonzero = turns.filter(t => (t.inp + t.cc + t.cr + t.out) > 0);
+  return { turns: nonzero, firstTs, lastTs };
+}
+
+/**
+ * Compute context-growth factor for a session file: current-window per-turn
+ * size divided by baseline-window per-turn size. Named computeWasteFactor for
+ * historical reasons (original product framing); retained to avoid a churny
+ * rename across all call sites. User-facing copy uses "context growth factor"
+ * per feedback_entient_spend_reconciles_does_not_hide.md.
+ *
  * Returns { turns, baseline, current, factor, blocked } or null.
  */
 function computeWasteFactor(sessionFile, cfg = DEFAULTS) {
@@ -688,7 +734,7 @@ function hookPrompt() {
   if (cfg.mode === "shadow") {
     logShadowEvent("would_block_prompt", file, w, cfg);
     process.stderr.write(
-      `[entient-spend] SHADOW: session at ${w.factor}x waste after ${w.turns} turns` +
+      `[entient-spend] SHADOW: session at ${w.factor}x context growth after ${w.turns} turns` +
       ` (enforce threshold: ${cfg.threshold}x). Observing only.\n`
     );
     process.exit(0);
@@ -816,7 +862,7 @@ function hookTool() {
   if (cfg.mode === "shadow") {
     logShadowEvent("would_block_tool", file, w, cfg);
     process.stderr.write(
-      `[entient-spend] SHADOW: session at ${w.factor}x waste after ${w.turns} turns` +
+      `[entient-spend] SHADOW: session at ${w.factor}x context growth after ${w.turns} turns` +
       ` (enforce threshold: ${cfg.threshold}x). Observing only.\n`
     );
     process.exit(0);
@@ -848,7 +894,7 @@ function hookTool() {
 
   const status = stagingOk ? `continuity secured` : `continuity staging degraded`;
   process.stderr.write(
-    `[entient-spend] tool at ${w.factor}x waste — ${status}. ` +
+    `[entient-spend] tool at ${w.factor}x context growth — ${status}. ` +
     (wrapperActive ? `Wrapper will rotate session shortly.\n`
                    : `Consider /clear; handoff at ${preserved && preserved.contextPath ? preserved.contextPath : "~/.entient-spend/last-session.md"}.\n`)
   );
@@ -1029,7 +1075,10 @@ function _riskState(wFactor, cost, cfg) {
 
 function hookStatus() {
   try {
-    const file = currentSessionFile();
+    // ENTIENT_SPEND_SESSION_FILE overrides session auto-detect, for preview
+    // tooling and deterministic tests.  Normal runs use currentSessionFile().
+    const override = process.env.ENTIENT_SPEND_SESSION_FILE;
+    const file = (override && fs.existsSync(override)) ? override : currentSessionFile();
     if (!file) { process.exit(0); }
 
     const mode = (process.env.ENTIENT_SPEND_HUD || "default").toLowerCase();
@@ -1053,34 +1102,67 @@ function hookStatus() {
     const quiet = risk.word === "ok" && saved.count === 0 && turnsN < 30;
     if (quiet) { process.exit(0); }
 
-    // ── Line 1: trajectory ───────────────────────────────────────────────────
-    // Subscription: ⛔ 4× burn · 128t   (icon + waste + turns; no $)
-    // API mode:      $197.16 · ⛔ 4× · 128t
-    const parts1 = [];
-    if (showDollars) parts1.push(`$${cost.toFixed(2)}`);
-    if (w && risk.word !== "ok") parts1.push(`${risk.icon} ${w.factor}× burn`);
-    else if (w)                  parts1.push(`${w.factor}× burn`);
-    parts1.push(`${turnsN}t`);
-    let line1 = parts1.join(" · ");
+    // ── Breakdown: compute per-turn totals and cache-read share for the
+    //    current window, so the HUD carries its own receipts.  Source of
+    //    truth is the session JSONL; this re-reads it once per render.  See
+    //    factorAudit() for the full math and feedback_entient_spend_reconciles
+    //    _does_not_hide.md for why we expose the breakdown rather than hide it.
+    let baseKpt = null, curKpt = null, cacheReadPct = null;
+    if (w && w.baseline && w.current) {
+      baseKpt = Math.round(w.baseline / 1000);
+      curKpt  = Math.round(w.current  / 1000);
+      try {
+        const { turns: raw } = readSessionTurnsRaw(file);
+        if (raw.length >= cfg.windowTurns) {
+          const curWin = raw.slice(-cfg.windowTurns);
+          let cr = 0, all4 = 0;
+          for (const t of curWin) {
+            cr   += t.cr;
+            all4 += t.inp + t.cc + t.cr + t.out;
+          }
+          if (all4 > 0) cacheReadPct = Math.round((cr / all4) * 100);
+        }
+      } catch (_) { /* fail open: HUD still renders without the pct */ }
+    }
 
-    // ── Line 2: value returned ──────────────────────────────────────────────
-    // Subscription: count of skipped LLM calls (the real value to a Pro user).
-    // API mode:      adds the $-equivalent. Always tagged ~est unless measured.
+    // ── Line 1: headline growth factor ──────────────────────────────────────
+    //   "3.2× context growth"  (with risk icon when elevated)
+    let line1;
+    if (w && w.factor) {
+      const icon = risk.word !== "ok" ? `${risk.icon} ` : "";
+      line1 = `${icon}${w.factor}× context growth`;
+    } else {
+      line1 = `${turnsN}t · growth pending (session warming up)`;
+    }
+
+    // ── Line 2: the numbers line 1 derives from ─────────────────────────────
+    //   "169k → 542k tokens/turn · 128t"
     let line2;
+    if (baseKpt !== null && curKpt !== null) {
+      line2 = `${baseKpt}k → ${curKpt}k tokens/turn · ${turnsN}t`;
+    } else {
+      line2 = `${turnsN}t · baseline window not yet established`;
+    }
+
+    // ── Line 3: source attribution + skipped-calls value ────────────────────
+    //   "97% from cache-read accumulation · 12 LLM calls skipped"
+    const pieces3 = [];
+    if (cacheReadPct !== null) pieces3.push(`${cacheReadPct}% from cache-read accumulation`);
     if (saved.count > 0) {
       const noun = saved.count === 1 ? "LLM call skipped" : "LLM calls skipped";
       if (showDollars) {
         const tag = saved.measured ? "" : " ~est";
-        line2 = `saved $${saved.usd.toFixed(2)}${tag} · ${saved.count} ${noun}`;
+        pieces3.push(`saved $${saved.usd.toFixed(2)}${tag} · ${saved.count} ${noun}`);
       } else {
-        line2 = `${saved.count} ${noun}`;
+        pieces3.push(`${saved.count} ${noun}`);
       }
-    } else {
-      line2 = "monitoring only · no skipped calls yet";
     }
+    let line3 = pieces3.join(" · ");
 
     // ── Variants ─────────────────────────────────────────────────────────────
     if (mode === "minimal") {
+      // One-line compact form for users who want a skinny bar.  Still uses
+      // "growth" language to stay consistent with the main HUD.
       const mini = [];
       if (showDollars) mini.push(`$${cost.toFixed(2)}`);
       if (w && risk.word !== "ok") mini.push(`${risk.icon} ${w.factor}×`);
@@ -1101,12 +1183,20 @@ function hookStatus() {
       line1 += ` · ${apiEquiv} · ${billTag}`;
       if (top) {
         const tag = top.blocked_kind ? `${top.tag}:${top.blocked_kind}` : top.tag;
-        line2 += ` | ${tag} ${top.name} → ${_shortAction(top.next_action)}`;
+        if (line3) line3 += ` | ${tag} ${top.name} → ${_shortAction(top.next_action)}`;
+        else       line3  = `${tag} ${top.name} → ${_shortAction(top.next_action)}`;
       }
-      line2 += ` · ${cacheTag}`;
+      if (line3) line3 += ` · ${cacheTag}`;
+      else       line3  = cacheTag;
     }
 
-    process.stdout.write(line1 + "\n" + line2);
+    // Emit the HUD: 2 lines when there's no attribution/value to show on line 3,
+    // 3 lines when either the cache-read pct or the skipped-calls count exists.
+    if (line3) {
+      process.stdout.write(line1 + "\n" + line2 + "\n" + line3);
+    } else {
+      process.stdout.write(line1 + "\n" + line2);
+    }
   } catch (_) { /* fail silent */ }
   process.exit(0);
 }
@@ -1184,7 +1274,7 @@ function saveSessionContext(sessionFile, waste) {
     branch ? `- **Branch:** ${branch}` : null,
     `- **Saved:** ${new Date().toISOString()}`,
     waste ? `- **Session size:** ${waste.turns} turns, ~${(waste.current / 1000).toFixed(0)}k tokens/turn` : null,
-    waste ? `- **Waste factor:** ${waste.factor}x (started at ~${(waste.baseline / 1000).toFixed(0)}k/turn)` : null,
+    waste ? `- **Context growth factor:** ${waste.factor}x (started at ~${(waste.baseline / 1000).toFixed(0)}k/turn)` : null,
     headSubject ? `- **Last commit on branch:** ${headSubject}` : null,
     `- **Handoff ready:** ${ready ? "yes" : `no — ${readyReason}`}`,
     ``,
@@ -1365,7 +1455,7 @@ function install() {
 
   if (added > 0) {
     console.log(`\n✓ entient-spend installed (${added} hooks added)`);
-    console.log(`  Threshold: ${DEFAULTS.threshold}x waste factor`);
+    console.log(`  Threshold: ${DEFAULTS.threshold}x context growth factor`);
     console.log(`  Config:    ${CONFIG_FILE}`);
     console.log(`  Context:   ${LAST_SESSION}`);
     console.log(`\n  To skip enforcement on a session: set ENTIENT_SPEND_SKIP=1`);
@@ -1416,7 +1506,7 @@ function installAutorestart() {
   console.log(`\n  USAGE:`);
   console.log(`    powershell -ExecutionPolicy Bypass -File "${loopPath}"`);
   console.log(`\n  Run that instead of 'claude'.`);
-  console.log(`  When a session hits ${DEFAULTS.threshold}x waste, it will rotate automatically.`);
+  console.log(`  When a session hits ${DEFAULTS.threshold}x context growth, it will rotate automatically.`);
   console.log(`  Context is saved and injected into the fresh session.`);
   console.log(`\n  To revert: entient-spend uninstall`);
 }
@@ -1427,7 +1517,7 @@ function _claudeLoopScript() {
   // The hook kills its parent node PID and writes the restart-flag.
   // When claude exits, check flag and relaunch.
   return String.raw`# claude-loop.ps1 -- generated by entient-spend install-autorestart
-# Run this instead of 'claude'. Sessions rotate automatically when waste hits threshold.
+# Run this instead of 'claude'. Sessions rotate automatically when context growth hits threshold.
 # Usage: .\claude-loop.ps1
 
 $flagPath    = Join-Path $HOME ".entient-spend\restart-flag"
@@ -1440,7 +1530,7 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "[claude-loop] Starting. Auto-restart ON." -ForegroundColor Cyan
-Write-Host "[claude-loop] Sessions rotate at waste threshold. Context injected on each start." -ForegroundColor DarkCyan
+Write-Host "[claude-loop] Sessions rotate at context-growth threshold. Context injected on each start." -ForegroundColor DarkCyan
 Write-Host ""
 
 while ($restarts -lt $maxRestarts) {
@@ -1515,7 +1605,7 @@ function shadowReport() {
   }
   console.log("");
 
-  console.log(`  WASTE FACTOR DISTRIBUTION  (when events fired)`);
+  console.log(`  CONTEXT GROWTH FACTOR DISTRIBUTION  (when events fired)`);
   console.log(`    Min: ${minFactor}x    Avg: ${avgFactor}x    Max: ${maxFactor}x`);
   const buckets = Object.entries(byFactor).map(([k,v]) => [parseInt(k),v]).sort((a,b)=>a[0]-b[0]);
   for (const [f, n] of buckets) {
@@ -1559,7 +1649,7 @@ function installShadow() {
   // 2. Write mode: shadow to config
   const cfg = saveConfig({ mode: "shadow" });
   console.log(`\n  Shadow mode ON.`);
-  console.log(`  Hooks will warn (stderr) when waste threshold is exceeded, but will NOT block.`);
+  console.log(`  Hooks will warn (stderr) when context-growth threshold is exceeded, but will NOT block.`);
   console.log(`  To upgrade to full enforcement: entient-spend install`);
   console.log(`  Config: ${CONFIG_FILE}  (mode: "${cfg.mode}", threshold: ${cfg.threshold}x)`);
 }
@@ -1602,17 +1692,17 @@ function status() {
     } catch (_) {}
   }
 
-  // Current session waste
+  // Current session context growth
   const file = currentSessionFile();
   if (file) {
     const w = computeWasteFactor(file);
     console.log(`\n  Current session:`);
-    console.log(`    Turns:         ${w.turns}`);
+    console.log(`    Turns:          ${w.turns}`);
     if (w.baseline) {
-      console.log(`    Baseline:      ~${(w.baseline/1000).toFixed(0)}k tokens/turn`);
-      console.log(`    Current:       ~${(w.current/1000).toFixed(0)}k tokens/turn`);
+      console.log(`    Baseline:       ~${(w.baseline/1000).toFixed(0)}k tokens/turn`);
+      console.log(`    Current:        ~${(w.current/1000).toFixed(0)}k tokens/turn`);
       const cfg2 = loadConfig();
-      console.log(`    Waste factor:  ${w.factor}x ${w.factor >= cfg2.threshold ? "⚠ WOULD BLOCK" : w.factor >= cfg2.saveThreshold ? "⚠ APPROACHING" : "✓ ok"}`);
+      console.log(`    Growth factor:  ${w.factor}x ${w.factor >= cfg2.threshold ? "⚠ WOULD BLOCK" : w.factor >= cfg2.saveThreshold ? "⚠ APPROACHING" : "✓ ok"}`);
     }
   }
 
@@ -1898,7 +1988,7 @@ function emitWarningLight(sessionFile) {
       st._ts = Date.now();
       all[sid] = st;
       _saveFireState(all);
-      // stderr = user-visible channel in Claude Code (matches existing waste-factor warnings).
+      // stderr = user-visible channel in Claude Code (matches existing context-growth warnings).
       process.stderr.write(line + "\n");
     }
   } catch (_) { /* fail silent */ }
@@ -2258,10 +2348,10 @@ function formatReport(sub, window) {
   }
   if (!enforced2) {
     lines.push(`  ${step++}. Run entient-spend install to enforce this automatically.`);
-    lines.push(`     Sessions get blocked at 10x waste. Context saved. Injected on resume.`);
+    lines.push(`     Sessions get blocked at 10x context growth. Context saved. Injected on resume.`);
     lines.push("");
   } else {
-    lines.push(`  ${step++}. Enforcement is ON. Sessions will be blocked at 10x waste.`);
+    lines.push(`  ${step++}. Enforcement is ON. Sessions will be blocked at 10x context growth.`);
     lines.push(`     Config: ~/.entient-spend/config.json`);
     lines.push("");
   }
@@ -2456,6 +2546,7 @@ function parseArgs() {
     else if (args[i] === "setup")            { opts.command = "setup";             }
     else if (args[i] === "billing")          { opts.command = "billing";           }
     else if (args[i] === "reconcile") { opts.command = "reconcile"; opts.reconcileFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
+    else if (args[i] === "factor-audit") { opts.command = "factor-audit"; opts.factorAuditFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "redundancy") {
       opts.command = "redundancy";
       if (args[i+1] && !args[i+1].startsWith("--")) opts.sessionFile = args[++i];
@@ -2477,7 +2568,7 @@ function parseArgs() {
     else if (args[i] === "--help" || args[i] === "-h") {
       console.log("Usage: entient-spend [install|install --shadow|uninstall|status] [--last 7d] [--json]");
       console.log("  install --shadow   Install hooks in observe-only mode (warn, never block)");
-      console.log("  install            Install hooks in enforce mode (blocks at 10x waste)");
+      console.log("  install            Install hooks in enforce mode (blocks at 10x context growth)");
       process.exit(0);
     }
   }
@@ -2708,7 +2799,7 @@ function printDashboard(sub, bug, enforced, window, billing) {
   console.log(`  STATUS`);
   console.log(`  ${SL}`);
   const enfLabel = enforced ? "ON" : yl("OFF");
-  const enfNote  = enforced ? dim("  (sessions blocked at 5x waste, context auto-saved)") : dim("  →  type 4 to install");
+  const enfNote  = enforced ? dim("  (sessions blocked at 5x context growth, context auto-saved)") : dim("  →  type 4 to install");
   console.log(`  Auto-enforcement    ${enfLabel}${enfNote}`);
   const bugLabel = bug.bugged > 0 ? yl(`AFFECTED  (${Math.round(bug.bugged/bug.total*100)}% of recent sessions)`) : "CLEAR";
   const bugNote  = bug.bugged > 0 ? dim("  →  type 3 for details") : dim("  (you're on a clean version)");
@@ -3117,7 +3208,7 @@ ${(() => {
   if (hasWM)  items.push({ title: `Switch to Haiku for ${wm.haikuPct}% of your work`, body: `Your sessions ran ${model} on prompts that didn't need it. Start with <code style="color:#79c0ff">/model haiku</code>. Escalate to Sonnet only when the task gets complex.` });
   if (hasBl)  items.push({ title: `Stop the confirmation loop (${topBl}% of your turns)`, body: `"ok", "proceed", "continue" — each one re-sent your full context at full price. Batch your intent. Say what you want in one prompt instead of three.` });
   if (hasRep) items.push({ title: `Rotate sessions after 30 turns (you ran ${topRH}h)`, body: `Context cost compounds. By turn 30+, you're paying 10-20x more per prompt just to carry history. Use <code style="color:#79c0ff">/compact</code> or start fresh and paste a one-paragraph summary.` });
-  if (!enforced) items.push({ title: "Enable auto-enforcement", body: `Run <code style="color:#79c0ff">entient-spend install</code> to block sessions at 10x waste automatically. Context is saved before each block and injected when you resume.` });
+  if (!enforced) items.push({ title: "Enable auto-enforcement", body: `Run <code style="color:#79c0ff">entient-spend install</code> to block sessions at 10x context growth automatically. Context is saved before each block and injected when you resume.` });
   if (items.length === 0) items.push({ title: "Looking clean", body: "No significant waste patterns in this window. Keep sessions short, match the model to the work." });
   const cols = items.map(item => `<div><div style="font-weight:600;margin-bottom:6px;color:#58a6ff">${item.title}</div><div style="font-size:13px;color:#8b949e;line-height:1.6">${item.body}</div></div>`).join("");
   return `<div class="section"><div class="section-title">What to do — based on your data</div><div style="display:grid;grid-template-columns:${items.length > 1 ? "1fr 1fr" : "1fr"};gap:16px">${cols}</div></div>`;
@@ -3423,6 +3514,139 @@ function billingReport(windowStr = "30d") {
   console.log("");
 }
 
+// ── Factor audit ─────────────────────────────────────────────────────────────
+// Explains the context-growth-factor math for a single Claude Code session
+// JSONL.  This is the trust-earning surface: for any session, show the raw
+// per-turn usage, compute the factor under several candidate formulas
+// (field selection × window × rounding), and mark which combination produced
+// the HUD number.  Purpose is to make the "3x vs 5x vs whatever" discrepancy
+// verifiable, not opaque.  See feedback_entient_spend_reconciles_does_not_hide.md.
+
+function factorAudit(sessionFileArg) {
+  // Resolve session file: explicit arg wins; else fall back to the most
+  // recently modified session JSONL under ~/.claude/projects/<cwd-slug>/.
+  let sessionFile = sessionFileArg;
+  if (!sessionFile) {
+    const s = currentSessionFile();
+    if (s) sessionFile = s;
+  }
+  if (!sessionFile) {
+    console.log("No session file given and none auto-detected.");
+    console.log("Usage: entient-spend factor-audit <session.jsonl>");
+    process.exit(2);
+  }
+  if (!fs.existsSync(sessionFile)) {
+    console.log(`Session file not found: ${sessionFile}`);
+    process.exit(2);
+  }
+
+  const { turns, firstTs, lastTs } = readSessionTurnsRaw(sessionFile);
+  const cfg = loadConfig();
+
+  console.log("");
+  console.log("── entient-spend factor-audit ──");
+  console.log("");
+  console.log(`  Session file: ${sessionFile}`);
+  console.log(`  Turns:        ${turns.length}`);
+  if (firstTs && lastTs) console.log(`  Span:         ${firstTs} → ${lastTs}`);
+  console.log(`  Windows:      baseline=first ${cfg.baselineTurns} turns, current=last ${cfg.windowTurns} turns`);
+  console.log("");
+
+  if (turns.length < cfg.minTurns) {
+    console.log(`  Session has ${turns.length} turns — below minTurns=${cfg.minTurns}.`);
+    console.log(`  No factor would be reported; session is considered warming up.`);
+    console.log("");
+    return;
+  }
+
+  // Totals and aggregates across the session (for context).
+  let sInp=0, sCC=0, sCR=0, sOut=0;
+  for (const t of turns) { sInp+=t.inp; sCC+=t.cc; sCR+=t.cr; sOut+=t.out; }
+  const k = n => Math.round(n / 1000) + "k";
+  console.log(`  Session totals (raw API usage fields):`);
+  console.log(`    input_tokens                ${sInp.toLocaleString().padStart(12)}  (${k(sInp)})`);
+  console.log(`    cache_creation_input_tokens ${sCC.toLocaleString().padStart(12)}  (${k(sCC)})`);
+  console.log(`    cache_read_input_tokens     ${sCR.toLocaleString().padStart(12)}  (${k(sCR)})`);
+  console.log(`    output_tokens               ${sOut.toLocaleString().padStart(12)}  (${k(sOut)})`);
+  console.log(`    ─ grand total (all four)    ${(sInp+sCC+sCR+sOut).toLocaleString().padStart(12)}  (${k(sInp+sCC+sCR+sOut)})`);
+  console.log("");
+
+  // Last 10 turns at raw granularity (tails are what the factor actually
+  // measures, so making them visible is half the transparency job).
+  console.log(`  Last 10 turns (raw per-turn usage):`);
+  console.log(`    ${"turn".padStart(5)} ${"inp".padStart(10)} ${"cc".padStart(10)} ${"cr".padStart(10)} ${"out".padStart(10)} ${"all4".padStart(10)}`);
+  const tail = turns.slice(-10);
+  const baseIdx = turns.length - tail.length;
+  for (let i = 0; i < tail.length; i++) {
+    const t = tail[i];
+    const n = baseIdx + i + 1;
+    const all4 = t.inp + t.cc + t.cr + t.out;
+    console.log(
+      `    ${String(n).padStart(5)} ${t.inp.toLocaleString().padStart(10)} ${t.cc.toLocaleString().padStart(10)} ${t.cr.toLocaleString().padStart(10)} ${t.out.toLocaleString().padStart(10)} ${all4.toLocaleString().padStart(10)}`
+    );
+  }
+  console.log("");
+
+  // Candidate formulas over the field-selection axis. All use per-turn sums
+  // within the same window → one number per (formula, window) pair.
+  const base5 = turns.slice(0, cfg.baselineTurns);
+  const cur5  = turns.slice(-cfg.windowTurns);
+  const base1 = turns.slice(0, 1);
+  const cur1  = turns.slice(-1);
+
+  const per = {
+    "F1 input only          ": t => t.inp,
+    "F2 input + cc          ": t => t.inp + t.cc,
+    "F3 input + cc + cr     ": t => t.inp + t.cc + t.cr,
+    "F4 input + cc + cr+out★": t => t.inp + t.cc + t.cr + t.out,  // current
+  };
+
+  const avgOf = (arr, fn) => arr.length ? arr.reduce((s,t)=>s+fn(t),0) / arr.length : 0;
+
+  console.log(`  Factor under candidate formulas:`);
+  console.log(`    ${"formula".padEnd(26)} ${"baseline/turn".padStart(14)} ${"current/turn".padStart(14)} ${"raw".padStart(8)} ${".1 round".padStart(10)} ${"ceil int".padStart(10)}`);
+  console.log(`    ${"-- 5-turn window (current) --".padEnd(26)}`);
+  for (const [label, fn] of Object.entries(per)) {
+    const b = avgOf(base5, fn), c = avgOf(cur5, fn);
+    const raw = b > 0 ? c / b : 0;
+    const r1  = b > 0 ? Math.round(raw * 10) / 10 : 0;
+    const ru  = b > 0 ? Math.ceil(raw) : 0;
+    console.log(
+      `    ${label.padEnd(26)} ${Math.round(b).toLocaleString().padStart(14)} ${Math.round(c).toLocaleString().padStart(14)} ${raw.toFixed(2).padStart(8)} ${r1.toFixed(1).padStart(9)}x ${String(ru).padStart(9)}x`
+    );
+  }
+  console.log(`    ${"-- single-turn baseline/current (narrower like clauditor probably uses) --".padEnd(26)}`);
+  for (const [label, fn] of Object.entries(per)) {
+    const b = avgOf(base1, fn), c = avgOf(cur1, fn);
+    const raw = b > 0 ? c / b : 0;
+    const r1  = b > 0 ? Math.round(raw * 10) / 10 : 0;
+    const ru  = b > 0 ? Math.ceil(raw) : 0;
+    console.log(
+      `    ${label.padEnd(26)} ${Math.round(b).toLocaleString().padStart(14)} ${Math.round(c).toLocaleString().padStart(14)} ${raw.toFixed(2).padStart(8)} ${r1.toFixed(1).padStart(9)}x ${String(ru).padStart(9)}x`
+    );
+  }
+  console.log("");
+  console.log(`  ★ = current entient-spend formula (F4, 5-turn window, 1-decimal round)`);
+  console.log("");
+
+  // Double-check: direct call of the production code path for parity.
+  const prod = computeWasteFactor(sessionFile, cfg);
+  console.log(`  Production computeWasteFactor() on this file:`);
+  console.log(`    turns=${prod.turns}  baseline=${prod.baseline}  current=${prod.current}  factor=${prod.factor}x  would-block=${prod.blocked}`);
+  console.log("");
+
+  console.log(`  Notes:`);
+  console.log(`    - The 4 F-rows are NOT 4 product choices; they're 4 views of the same`);
+  console.log(`      session bytes under different field-selection rules. F4 is what ships.`);
+  console.log(`    - Single-turn vs 5-turn windowing has a large effect on the factor when`);
+  console.log(`      any single turn is spiky (system prompt refresh, big tool output, etc.).`);
+  console.log(`    - Rounding differences (1-decimal vs ceil-to-int) account for up to ~1x`);
+  console.log(`      on borderline numbers. 4.6 rounds to 4.6 (ours) or 5 (ceil).`);
+  console.log(`    - If a third-party tool reports a different factor on the same file,`);
+  console.log(`      the gap is locatable by matching its number to a cell above.`);
+  console.log("");
+}
+
 // ── Reconcile command ────────────────────────────────────────────────────────
 // Reads claude-audit-billing.json (from the entient-spend extension export) and cross-references
 // with metering.db to explain every Anthropic email receipt.
@@ -3606,7 +3830,7 @@ print(json.dumps([{'date':r[0],'model':r[1],'tokens':r[2],'cost':r[3],'calls':r[
 // Ports the data sources the tray icon already polls (entient-agent/tools/entient_tray.ps1):
 //   ~/.entient/governance/governance_events.jsonl  — deflect / forward events
 //   ~/.entient/forwards/forwards.jsonl             — intake pipeline
-// Customer-framed output: inferences deferred, tokens saved, $ saved, session waste factor.
+// Customer-framed output: inferences deferred, tokens saved, $ saved, session context growth factor.
 
 // Env overrides enable testing against a fake governance log without
 // touching real data. CLI and hook paths use the defaults in production.
@@ -3716,7 +3940,7 @@ function renderHud() {
   const fwd = countForwards();
   const running = watcherRunning();
 
-  // Session waste factor (reuse existing logic)
+  // Session context growth factor (reuse existing logic)
   let sessionLine = dim("no active session detected");
   try {
     const sf = currentSessionFile();
@@ -3725,7 +3949,7 @@ function renderHud() {
       const factor = w.factor || 1;
       const thresh = DEFAULTS.threshold;
       const pct = Math.min(100, (factor / thresh) * 100);
-      sessionLine = `waste factor ${bold(factor + "x")} / ${thresh}x kill  ${bar(pct, 20)}  turns=${w.turns}`;
+      sessionLine = `growth factor ${bold(factor + "x")} / ${thresh}x kill  ${bar(pct, 20)}  turns=${w.turns}`;
     }
   } catch (_) {}
 
@@ -3870,6 +4094,7 @@ function main() {
   if (opts.command === "count-tokens"){ countTokensCmd({ model: opts.model, text: opts.text, json: opts.json }); return; }
   if (opts.command === "cost-report") { costReportCmd(opts.last); return; }
   if (opts.command === "reconcile") { reconcile(opts.reconcileFile); return; }
+  if (opts.command === "factor-audit") { factorAudit(opts.factorAuditFile); return; }
   if (opts.command === "redundancy") { redundancyReport(opts); return; }
   if (opts.command === "gate-stats") { gateStatsCmd(); return; }
   if (opts.command === "hud")       { hud(); return; }
