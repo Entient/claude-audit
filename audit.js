@@ -803,31 +803,176 @@ function hookStart() {
   process.exit(0);
 }
 
-// Claude Code statusLine — one-line spend indicator rendered above the input box.
-// Must be fast (≤ ~50ms) and fail-silent (a broken statusline hides itself).
+// Claude Code statusLine — 2-line operator HUD rendered above the input box.
+// Must be fast (≤ ~150ms) and fail-silent (a broken statusline hides itself).
+// Variants via ENTIENT_SPEND_HUD: minimal | default | debug (default = default).
+//
+// Line 1 — "what's it costing / what's the risk / what's ENTIENT saved":
+//   spend $4.17 · ⚠ 3.2× risk · 45t · saved $12.40
+// Line 2 — "what needs my attention / what's next":
+//   FRONTIER gateway → Step 6 ship: build entient/gateway:v1.0.0 Docker image…
+// Silent by default below warn thresholds. Attention line uses a 30s cache so
+// project_register.banner_line (~700ms cold) never blocks the hot path.
+
+const _HUD_CACHE_PATH = path.join(os.homedir(), ".entient", "v2", "spend_hud_cache.json");
+const _HUD_CACHE_TTL_S = 30;
+const _HUD_SNAPSHOT_SCRIPT = "C:/Users/Brock1/Desktop/Agent/tools/hud_snapshot.py";
+
+function _sessionStartTs(sessionFile) {
+  // First Claude Code session record has no timestamp; scan up to 64KB for one.
+  try {
+    const fd = fs.openSync(sessionFile, "r");
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const text = buf.toString("utf8", 0, n);
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let rec; try { rec = JSON.parse(line); } catch (_) { continue; }
+      const ts = rec.timestamp || rec.ts;
+      if (typeof ts === "string") { const v = Date.parse(ts); if (v) return v / 1000; }
+      if (typeof ts === "number") return ts;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _readSessionSavings(sinceTs) {
+  // Sum deflect_measured (precise) + deflect (estimated). Mirrors the
+  // measurement-vs-rule-of-thumb split used by the full billing report.
+  if (!sinceTs) return { usd: 0, count: 0, measured: false };
+  const raw = tailBytes(ENTIENT_GOV_LOG, 4 * 1024 * 1024);
+  if (!raw) return { usd: 0, count: 0, measured: false };
+  const lines = raw.split("\n");
+  lines.shift(); // first line may be byte-truncated mid-record
+  let usd = 0, count = 0, measuredHits = 0;
+  for (const line of lines) {
+    if (!line) continue;
+    let rec; try { rec = JSON.parse(line); } catch (_) { continue; }
+    if (typeof rec.ts !== "number" || rec.ts < sinceTs) continue;
+    if (rec.type === "deflect_measured") {
+      const d = rec.data || {};
+      if (d.status === "ok") {
+        usd += d.input_cost_usd_avoided || 0;
+        measuredHits++;
+        count++;
+      }
+    } else if (rec.type === "deflect") {
+      usd += AVG_USD_PER_INFERENCE;
+      count++;
+    }
+  }
+  return { usd, count, measured: measuredHits > 0 };
+}
+
+function _readHudCache() {
+  try {
+    const raw = fs.readFileSync(_HUD_CACHE_PATH, "utf8");
+    const data = JSON.parse(raw);
+    const ageS = Date.now() / 1000 - (data.ts || 0);
+    return { data, ageS, fresh: ageS < _HUD_CACHE_TTL_S };
+  } catch (_) {
+    return { data: null, ageS: Infinity, fresh: false };
+  }
+}
+
+function _refreshHudCacheAsync() {
+  try {
+    const child = require("child_process").spawn(
+      "python", [_HUD_SNAPSHOT_SCRIPT],
+      { detached: true, stdio: "ignore", windowsHide: true }
+    );
+    child.unref();
+  } catch (_) {}
+}
+
+function _truncate(s, n) {
+  if (!s) return "";
+  s = String(s).replace(/\s+/g, " ").trim();
+  return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+// Compress an authored next_action down to verb + outcome.
+// Strips "Step N ship:" / "Phase N:" boilerplate, takes first clause only,
+// caps at 50 chars. The HUD answers "what do I do next" — not the full task.
+function _shortAction(text) {
+  if (!text) return "";
+  let s = String(text).replace(/\s+/g, " ").trim();
+  s = s.replace(/^(Step|Phase)\s+\d+(\.\d+)?\s*[:—\-]?\s*/i, "");
+  s = s.replace(/^(ship|build|publish|land|wire|verify|run|fix|update|add)\s*[:—\-]\s*/i, "$1 ");
+  const firstClause = s.split(/[,.;]/)[0].trim();
+  return firstClause.length > 50 ? firstClause.slice(0, 49) + "…" : firstClause;
+}
+
+function _riskState(wFactor, cost, cfg) {
+  const blockAt = cfg.threshold ?? 5;
+  const warnAt  = cfg.saveThreshold ?? 3;
+  if ((wFactor != null && wFactor >= blockAt) || cost >= 10) return { icon: "⛔", word: "alarm" };
+  if ((wFactor != null && wFactor >= warnAt) || cost >= 5)   return { icon: "⚠",  word: "risk"  };
+  if ((wFactor != null && wFactor >= 2)       || cost >= 2)  return { icon: "⚠",  word: "warn"  };
+  return { icon: "·", word: "ok" };
+}
+
 function hookStatus() {
   try {
     const file = currentSessionFile();
     if (!file) { process.exit(0); }
+
+    const mode = (process.env.ENTIENT_SPEND_HUD || "default").toLowerCase();
     const cfg = loadConfig();
+
     const w = computeWasteFactor(file, cfg);
-    const turns = _readSessionTurnsPriced(file);
-    const cost = turns.length ? _sessionCostUSD(turns) : 0;
+    const priced = _readSessionTurnsPriced(file);
+    const cost = priced.length ? _sessionCostUSD(priced) : 0;
+    const turnsN = w ? w.turns : priced.length;
+    const sinceTs = _sessionStartTs(file);
+    const saved = _readSessionSavings(sinceTs);
+    const risk = _riskState(w ? w.factor : null, cost, cfg);
 
-    const blockAt = cfg.threshold ?? 5;
+    // Silence floor: no spend AND no value yet → nothing to surface.
+    if (cost < 0.50 && saved.usd < 0.10) { process.exit(0); }
 
-    // Silent below both waste-2× AND cost-$2 — don't pollute statusline when nothing's happening.
-    if ((!w || w.factor < 2) && cost < 2) { process.exit(0); }
+    // ── Line 1: spend + severity (icon-only state, no redundant word) ────────
+    const parts1 = [`$${cost.toFixed(2)}`];
+    if (w && risk.word !== "ok") parts1.push(`${risk.icon} ${w.factor}×`);
+    else if (risk.word !== "ok")  parts1.push(`${risk.icon}`);
+    let line1 = parts1.join(" · ");
 
-    let indicator = "·";
-    if ((w && w.factor >= blockAt) || cost >= 10) indicator = "⛔";
-    else if ((w && w.factor >= 3) || cost >= 5)   indicator = "⚠";
+    // ── Line 2: value returned (the customer-facing answer) ─────────────────
+    let line2;
+    if (saved.count > 0) {
+      const noun = saved.count === 1 ? "reused action" : "reused actions";
+      const measuredTag = saved.measured ? "" : "  ~est";
+      line2 = `saved $${saved.usd.toFixed(2)} · ${saved.count} ${noun}${measuredTag}`;
+    } else {
+      line2 = "monitoring only · no savings yet";
+    }
 
-    const segs = [`${indicator} spend`];
-    if (w) segs.push(`${w.factor}×`, `${w.turns}t`);
-    if (cost > 0) segs.push(`$${cost.toFixed(2)}`);
+    // ── Variants ─────────────────────────────────────────────────────────────
+    if (mode === "minimal") {
+      const mini = [`$${cost.toFixed(2)}`];
+      if (w && risk.word !== "ok") mini.push(`${risk.icon} ${w.factor}×`);
+      if (saved.count > 0) mini.push(`saved $${saved.usd.toFixed(2)}`);
+      process.stdout.write(mini.join(" · "));
+      process.exit(0);
+    }
 
-    process.stdout.write(segs.join(" · "));
+    if (mode === "debug") {
+      // Internal HUD only in debug — keeps default path Python-free.
+      const cache = _readHudCache();
+      if (!cache.fresh) _refreshHudCacheAsync();
+      const top = cache.data && cache.data.top;
+      const cacheTag = cache.data ? `cache=${Math.floor(cache.ageS)}s` : "cache=cold";
+      const modeTag = `mode=${cfg.mode || "enforce"}`;
+      line1 += ` · ${turnsN}t · ${modeTag}`;
+      if (top) {
+        const tag = top.blocked_kind ? `${top.tag}:${top.blocked_kind}` : top.tag;
+        line2 += ` | ${tag} ${top.name} → ${_shortAction(top.next_action)}`;
+      }
+      line2 += ` · ${cacheTag}`;
+    }
+
+    process.stdout.write(line1 + "\n" + line2);
   } catch (_) { /* fail silent */ }
   process.exit(0);
 }
