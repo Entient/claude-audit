@@ -728,16 +728,36 @@ function hookPrompt() {
   all[sid]     = st;
   _saveFireState(all);
 
-  const stateTag = stagingOk
-    ? (w.factor >= hardStopFactor ? "CLEAR_RECOMMENDED" : "STAGE")
-    : "STAGE (degraded)";
+  // CLEAR_RECOMMENDED is only honest when the handoff actually carries enough
+  // context for productive re-entry (branch + last commit + activity excerpt +
+  // inferred objective + inferred next action). Anything less is STAGE —
+  // doctrine: "Handoff not yet ready" never masquerades as "Safe to restart."
+  const readyForClear = stagingOk && preserved.ready;
+  const stateTag = !stagingOk
+    ? "STAGE (degraded)"
+    : (readyForClear && w.factor >= hardStopFactor)
+      ? "CLEAR_RECOMMENDED"
+      : "STAGE";
+
+  const statusLine = !stagingOk
+    ? `Continuity staging degraded.`
+    : preserved.ready
+      ? `Continuity secured.`
+      : `Handoff not yet ready — ${preserved.readyReason}.`;
 
   const preservedLines = [];
   if (stagingOk) {
     preservedLines.push(`  - Project: ${preserved.project}${preserved.branch ? ` on ${preserved.branch}` : ""}`);
     preservedLines.push(`  - Session: ${preserved.turns} turns`);
     if (preserved.headSubject)  preservedLines.push(`  - Last commit: ${preserved.headSubject}`);
-    if (preserved.modifiedCount) preservedLines.push(`  - Files in flight: ${preserved.modifiedCount}`);
+    if (preserved.dirty && preserved.dirty.total) {
+      const d = preserved.dirty;
+      preservedLines.push(`  - Files in flight: ${d.total} (staged ${d.staged.length} / unstaged ${d.unstaged.length} / untracked ${d.untracked.length})`);
+    } else {
+      preservedLines.push(`  - Files in flight: none (working tree clean)`);
+    }
+    if (preserved.objective)   preservedLines.push(`  - Objective (inferred): ${preserved.objective.slice(0, 120)}`);
+    if (preserved.nextAction)  preservedLines.push(`  - Next action (inferred): ${preserved.nextAction.slice(0, 120)}`);
     if (preserved.hasLastActivity) preservedLines.push(`  - Last activity excerpt: captured`);
     preservedLines.push(`  - Handoff: ${preserved.contextPath}`);
   } else {
@@ -745,14 +765,16 @@ function hookPrompt() {
     preservedLines.push(`  - Check ~/.entient-spend/ manually before rotating.`);
   }
 
-  const nextLine = wrapperActive
-    ? `  - claude-loop auto-restart wrapper is active — it will rotate this session shortly.`
-    : `  - Run \`/clear\` to rotate. SessionStart will inject the handoff into the next session.`;
+  const nextLine = !readyForClear
+    ? `  - Handoff incomplete — restate objective / next action in a follow-up prompt, then /clear when ready.`
+    : wrapperActive
+      ? `  - claude-loop auto-restart wrapper is active — it will rotate this session shortly.`
+      : `  - Run \`/clear\` to rotate. SessionStart will inject the handoff into the next session.`;
 
   const bannerLines = [
     ``,
     `CONTINUATION_POLICY: ${stateTag}`,
-    stagingOk ? `Continuity secured.` : `Continuity staging degraded.`,
+    statusLine,
     ``,
     `Preserved:`,
     ...preservedLines,
@@ -767,9 +789,10 @@ function hookPrompt() {
   ];
   const msg = bannerLines.join("\n");
 
-  // Hard-block reserved for severe pressure + valid staging + wrapper present.
-  // Doctrine forbids hard-stop if continuity cannot truthfully be claimed.
-  const canHardBlock = stagingOk && w.factor >= hardStopFactor && wrapperActive;
+  // Hard-block reserved for severe pressure + valid staging + ready handoff +
+  // wrapper present. Doctrine forbids hard-stop if continuity cannot truthfully
+  // be claimed — and an un-ready handoff is exactly that case.
+  const canHardBlock = readyForClear && w.factor >= hardStopFactor && wrapperActive;
   if (canHardBlock) {
     process.stdout.write(JSON.stringify({ decision: "block", reason: msg }) + "\n");
     triggerRestart(w);
@@ -3892,5 +3915,10 @@ if (require.main === module) {
     _readSessionSavings,
     currentSessionId,
     AVG_USD_PER_INFERENCE,
+    saveSessionContext,
+    inferObjective,
+    inferNextAction,
+    getStructuredDirty,
+    _readinessCheck,
   };
 }
