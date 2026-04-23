@@ -660,30 +660,31 @@ function hookPrompt() {
   const w = computeWasteFactor(file, cfg);
   if (!w) { process.exit(0); }
 
-  // Warning-light banner (stderr — the user-visible hook channel in Claude Code).
-  // Suppressed when we're about to emit a block-decision JSON so the user sees
-  // the full block banner instead of a redundant one-line warning beforehand.
-  const willBlock = w.blocked && cfg.mode !== "shadow" && !process.env.ENTIENT_SPEND_SKIP;
-  if (!willBlock) emitWarningLight(file);
+  // Warning-light (edge-triggered, stderr). Suppressed on hard-block so the
+  // co-pilot banner below is the only user-facing emission.
+  const wrapperActive = !!process.env.ENTIENT_SPEND_AUTORESTART;
+  const hardStopFactor = cfg.hardStopFactor ?? 10;
+  const willHardBlock = w.blocked && w.factor >= hardStopFactor
+                      && cfg.mode !== "shadow" && !process.env.ENTIENT_SPEND_SKIP;
+  if (!willHardBlock) emitWarningLight(file);
 
-  // Early warning: approaching threshold — run git savepoint now while Claude
-  // is still alive and can finish any in-progress task cleanly.
-  const saveThreshold = cfg.saveThreshold ?? 7;
+  // Early savepoint: approaching threshold — git savepoint while claude still alive.
+  const saveThreshold = cfg.saveThreshold ?? 3;
   if (!w.blocked && w.factor >= saveThreshold && !process.env.ENTIENT_SPEND_SKIP) {
     if (cfg.mode === "shadow") logShadowEvent("approaching", file, w, cfg);
     const saved = gitSavepoint();
     if (saved.length > 0) {
+      // Continuity-first: no token trivia, just "what was preserved."
       process.stderr.write(
-        `[entient-spend] WARNING: session at ${w.factor}x waste — rotation approaching (threshold ${cfg.threshold}x).\n` +
-        `[entient-spend] Auto-saved: ${saved.join(", ")}\n`
+        `[entient-spend] pressure rising — auto-saved ${saved.length} repo(s) to savepoint commits.\n`
       );
     }
-    process.exit(0);  // don't block yet
+    process.exit(0);
   }
 
   if (!w.blocked) { process.exit(0); }
 
-  // Shadow mode: warn but never block
+  // Shadow mode: warn but never block (unchanged — doctrine-aligned already).
   if (cfg.mode === "shadow") {
     logShadowEvent("would_block_prompt", file, w, cfg);
     process.stderr.write(
@@ -693,38 +694,90 @@ function hookPrompt() {
     process.exit(0);
   }
 
-  // Save context before blocking
-  saveSessionContext(file, w);
-
-  const autoRestart = !!process.env.ENTIENT_SPEND_AUTORESTART;
-
-  const msg = [
-    `+${"-".repeat(60)}+`,
-    `|  entient-spend: Session using ${w.factor}x more quota than start  `.padEnd(62) + "|",
-    `+${"-".repeat(60)}+`,
-    ``,
-    `Your turns started at ~${w.baseline.toLocaleString()} tokens.`,
-    `They're now at ~${w.current.toLocaleString()} tokens (${w.factor}x more per turn).`,
-    `After ${w.turns} turns, each prompt costs ${w.factor}x what it did at session start.`,
-    ``,
-    autoRestart
-      ? `Auto-restart is ON. Rotating session now...`
-      : `Session context saved. Start fresh: run \`claude\``,
-    `entient-spend will inject your previous context automatically.`,
-    ``,
-    `To continue anyway: set ENTIENT_SPEND_SKIP=1 in your environment.`,
-  ].join("\n");
-
+  // Skip env — recovery backdoor, honored silently (not advertised per doctrine).
   if (process.env.ENTIENT_SPEND_SKIP) { process.exit(0); }
 
-  // Output block decision first (so claude sees it before we kill the process)
-  process.stdout.write(JSON.stringify({ decision: "block", reason: msg }) + "\n");
+  // Stage continuity payload BEFORE any user-facing decision. Doctrine:
+  // "A continuity-preserving co-pilot must never hard-stop without first
+  // securing the handoff and showing what survives."  See pm/CONTINUATION_POLICY.md.
+  const preserved = saveSessionContext(file, w);
+  const stagingOk = !!(preserved && preserved.ok);
 
-  // Auto-restart: write flag + kill claude so the loop wrapper relaunches it
-  if (autoRestart) {
-    triggerRestart(w);
+  // Cooldown: one emission per threshold-band per session. Band = integer floor
+  // of factor. Re-fire only on a strictly higher band. Prevents nag-per-prompt.
+  const sid = currentSessionId();
+  const all = _pruneFireState(_loadFireState());
+  const st  = all[sid] || { warn5: false, alarm10: false, bump: false, stageBand: null, _ts: Date.now() };
+  const band = Math.floor(w.factor);
+  const firstFireForBand = st.stageBand === null || band > st.stageBand;
+
+  if (!firstFireForBand) {
+    // Already emitted for this band — stay quiet. Wrapper (if active) handles
+    // rotation independently; bare claude users get one discreet status line.
+    if (!wrapperActive) {
+      process.stderr.write(
+        `[entient-spend] continuation staged; /clear when ready.\n`
+      );
+    }
+    process.exit(0);
   }
 
+  // First fire for this band — record and build the co-pilot banner.
+  st.stageBand = band;
+  st._ts       = Date.now();
+  all[sid]     = st;
+  _saveFireState(all);
+
+  const stateTag = stagingOk
+    ? (w.factor >= hardStopFactor ? "CLEAR_RECOMMENDED" : "STAGE")
+    : "STAGE (degraded)";
+
+  const preservedLines = [];
+  if (stagingOk) {
+    preservedLines.push(`  - Project: ${preserved.project}${preserved.branch ? ` on ${preserved.branch}` : ""}`);
+    preservedLines.push(`  - Session: ${preserved.turns} turns`);
+    if (preserved.headSubject)  preservedLines.push(`  - Last commit: ${preserved.headSubject}`);
+    if (preserved.modifiedCount) preservedLines.push(`  - Files in flight: ${preserved.modifiedCount}`);
+    if (preserved.hasLastActivity) preservedLines.push(`  - Last activity excerpt: captured`);
+    preservedLines.push(`  - Handoff: ${preserved.contextPath}`);
+  } else {
+    preservedLines.push(`  - (staging failed — ${preserved && preserved.error ? preserved.error : "unknown error"})`);
+    preservedLines.push(`  - Check ~/.entient-spend/ manually before rotating.`);
+  }
+
+  const nextLine = wrapperActive
+    ? `  - claude-loop auto-restart wrapper is active — it will rotate this session shortly.`
+    : `  - Run \`/clear\` to rotate. SessionStart will inject the handoff into the next session.`;
+
+  const bannerLines = [
+    ``,
+    `CONTINUATION_POLICY: ${stateTag}`,
+    stagingOk ? `Continuity secured.` : `Continuity staging degraded.`,
+    ``,
+    `Preserved:`,
+    ...preservedLines,
+    ``,
+    `At risk:`,
+    `  - Turns since the last git savepoint (unstaged in-flight work).`,
+    ``,
+    `Next:`,
+    nextLine,
+    `  - Or keep working; rotation is recommended, not forced.`,
+    ``,
+  ];
+  const msg = bannerLines.join("\n");
+
+  // Hard-block reserved for severe pressure + valid staging + wrapper present.
+  // Doctrine forbids hard-stop if continuity cannot truthfully be claimed.
+  const canHardBlock = stagingOk && w.factor >= hardStopFactor && wrapperActive;
+  if (canHardBlock) {
+    process.stdout.write(JSON.stringify({ decision: "block", reason: msg }) + "\n");
+    triggerRestart(w);
+    process.exit(0);
+  }
+
+  // Default path: co-pilot STAGE recommendation to stderr. NO hard block.
+  process.stderr.write(msg + "\n");
   process.exit(0);
 }
 
@@ -736,7 +789,7 @@ function hookTool() {
   const w = computeWasteFactor(file, cfg);
   if (!w || !w.blocked) { process.exit(0); }
 
-  // Shadow mode: warn but never block
+  // Shadow mode: warn but never block.
   if (cfg.mode === "shadow") {
     logShadowEvent("would_block_tool", file, w, cfg);
     process.stderr.write(
@@ -746,18 +799,45 @@ function hookTool() {
     process.exit(0);
   }
 
-  saveSessionContext(file, w);
+  const wrapperActive = !!process.env.ENTIENT_SPEND_AUTORESTART;
+  const hardStopFactor = cfg.hardStopFactor ?? 10;
 
-  const autoRestart = !!process.env.ENTIENT_SPEND_AUTORESTART;
+  // Stage handoff BEFORE any decision (co-pilot doctrine).
+  const preserved = saveSessionContext(file, w);
+  const stagingOk = !!(preserved && preserved.ok);
 
+  // Cooldown by band, shared state file with hookPrompt / warning-light.
+  const sid = currentSessionId();
+  const all = _pruneFireState(_loadFireState());
+  const st  = all[sid] || { warn5: false, alarm10: false, bump: false, stageBand: null, toolBand: null, _ts: Date.now() };
+  const band = Math.floor(w.factor);
+  const firstFireForBand = st.toolBand === null || band > st.toolBand;
+
+  if (!firstFireForBand) {
+    // Band already emitted via tool path — stay quiet, let the tool run.
+    process.exit(0);
+  }
+
+  st.toolBand = band;
+  st._ts      = Date.now();
+  all[sid]    = st;
+  _saveFireState(all);
+
+  const status = stagingOk ? `continuity secured` : `continuity staging degraded`;
   process.stderr.write(
-    `[entient-spend] Session at ${w.factor}x waste (${w.turns} turns). ` +
-    (autoRestart ? `Auto-restarting...\n` : `Start fresh: run \`claude\`. Context saved to ${LAST_SESSION}\n`)
+    `[entient-spend] tool at ${w.factor}x waste — ${status}. ` +
+    (wrapperActive ? `Wrapper will rotate session shortly.\n`
+                   : `Consider /clear; handoff at ${preserved && preserved.contextPath ? preserved.contextPath : "~/.entient-spend/last-session.md"}.\n`)
   );
 
-  if (autoRestart) triggerRestart(w);
+  // Hard-block a tool call only at severe pressure + valid staging + wrapper.
+  // Otherwise let the tool through — blocking tools nag-per-call is the defect.
+  if (stagingOk && w.factor >= hardStopFactor && wrapperActive) {
+    triggerRestart(w);
+    process.exit(2);  // blocking error for PostToolUse
+  }
 
-  process.exit(2);  // exit code 2 = blocking error for PostToolUse
+  process.exit(0);
 }
 
 function hookCompact() {
@@ -1051,11 +1131,12 @@ function getLastActivity(sessionFile, maxEntries = 2, maxCharsEach = 1200) {
 function saveSessionContext(sessionFile, waste) {
   ensureAuditDir();
 
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const project    = path.basename(projectDir);
-  const branch     = getGitBranch(projectDir);
-  const modified   = getModifiedFiles(projectDir);
-  const lastWork   = sessionFile ? getLastActivity(sessionFile) : null;
+  const projectDir  = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const project     = path.basename(projectDir);
+  const branch      = getGitBranch(projectDir);
+  const modified    = getModifiedFiles(projectDir);
+  const lastWork    = sessionFile ? getLastActivity(sessionFile) : null;
+  const headSubject = getHeadCommitSubject(projectDir);
 
   const lines = [
     `# Previous Session (saved by entient-spend)`,
@@ -1067,14 +1148,44 @@ function saveSessionContext(sessionFile, waste) {
     waste ? `- **Session size:** ${waste.turns} turns, ~${(waste.current / 1000).toFixed(0)}k tokens/turn` : null,
     waste ? `- **Waste factor:** ${waste.factor}x (started at ~${(waste.baseline / 1000).toFixed(0)}k/turn)` : null,
     modified.length ? `- **Files modified:** ${modified.slice(0, 10).join(", ")}` : null,
+    headSubject ? `- **Last commit on branch:** ${headSubject}` : null,
     ``,
-    `## Resume`,
-    `Continue where you left off. The session was rotated to save quota.`,
-    `Check git status for open changes.`,
+    `## Resume hints (re-entry guide)`,
+    `The session was rotated under pressure. To re-enter productively:`,
+    ``,
+    `1. Skim **Last Activity** below for the active objective and mid-flight context.`,
+    `2. Run \`git status\` + \`git log --oneline -10\` for uncommitted changes and recent commits.`,
+    `3. Identify the next concrete action from the activity excerpt; continue from there.`,
+    `4. Active decisions, blockers, and next actions are inferred from the excerpt — restate explicitly in your first prompt to lock the thread.`,
     lastWork ? `\n## Last Activity\n${lastWork}` : null,
   ].filter(l => l !== null).join("\n");
 
-  fs.writeFileSync(LAST_SESSION, lines, "utf8");
+  try {
+    fs.writeFileSync(LAST_SESSION, lines, "utf8");
+    return {
+      ok: true,
+      contextPath: LAST_SESSION,
+      project,
+      branch: branch || null,
+      modifiedCount: modified.length,
+      headSubject: headSubject || null,
+      hasLastActivity: !!lastWork,
+      turns: waste ? waste.turns : null,
+      factor: waste ? waste.factor : null,
+    };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+function getHeadCommitSubject(dir) {
+  try {
+    const { execSync } = require("child_process");
+    const out = execSync("git log -1 --pretty=%s", {
+      cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim() || null;
+  } catch (_) { return null; }
 }
 
 function getGitBranch(dir) {
