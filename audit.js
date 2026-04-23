@@ -53,6 +53,15 @@ const CLAUDE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 const CLAUDE_HISTORY  = path.join(os.homedir(), ".claude", "history.jsonl");
 const PROJECTS_DIR    = path.join(os.homedir(), ".claude", "projects");
 
+// Canonical pressure-signal artifact consumed by Agent/continuation_policy.py.
+// See pm/CONTINUATION_POLICY.md §"Pressure-signal contract" for the wire format.
+// Single file, overwritten on each emit. No DB. No history (emission log on
+// the consumer side captures state transitions; this file is a live snapshot).
+const ENTIENT_V2_DIR  = path.join(os.homedir(), ".entient", "v2");
+const PRESSURE_SIGNAL = path.join(ENTIENT_V2_DIR, "spend_pressure.json");
+const PRESSURE_SCHEMA = "spend_pressure_v1";
+const PRESSURE_TTL_S  = 300;   // 5 min — consumer rejects older artifacts
+
 const DEFAULTS = {
   threshold:      5,   // context-growth factor that triggers session kill + restart (5x = each turn costs 5x session start)
   saveThreshold:  3,   // context-growth factor that triggers git savepoint + warning (early signal)
@@ -1125,6 +1134,12 @@ function hookStatus() {
       } catch (_) { /* fail open: HUD still renders without the pct */ }
     }
 
+    // ── Emit pressure-signal artifact as a side effect of render.  This is
+    //    the Level-1 producer half of the Continuation Policy loop (Agent-
+    //    side consumer reads ~/.entient/v2/spend_pressure.json).  Fail-safe:
+    //    emit errors do not affect HUD output.  See pm/CONTINUATION_POLICY.md.
+    try { emitPressureSignal(file, w, cacheReadPct); } catch (_) {}
+
     // ── Line 1: headline growth factor ──────────────────────────────────────
     //   "3.2× context growth"  (with risk icon when elevated)
     let line1;
@@ -1332,6 +1347,137 @@ function getHeadCommitSubject(dir) {
     });
     return out.trim() || null;
   } catch (_) { return null; }
+}
+
+// ── Pressure-signal producer ─────────────────────────────────────────────────
+// Writes ~/.entient/v2/spend_pressure.json — the single canonical artifact
+// consumed by Agent/continuation_policy.py::read_pressure_signal.  Invariant:
+// this is the ONLY producer of that file.  Agent-side CP consults no other
+// source for pressure-driven decisions.  Schema frozen at v1.  No DB.
+
+let _cachedProducerVersion = null;
+function _producerVersion() {
+  if (_cachedProducerVersion !== null) return _cachedProducerVersion;
+  let ver = "unknown";
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+    if (pkg && pkg.version) ver = pkg.version;
+  } catch (_) {}
+  try {
+    const { execSync } = require("child_process");
+    const sha = execSync("git rev-parse --short HEAD", {
+      cwd: __dirname, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (sha) ver = `${ver}+${sha}`;
+  } catch (_) { /* not a git checkout — ver stays at package.json version */ }
+  _cachedProducerVersion = ver;
+  return ver;
+}
+
+/**
+ * Build the pressure-signal payload from a computed growth-factor result and
+ * the raw-turn breakdown.  Pure: no I/O.  Exported so tests can verify shape.
+ *
+ * Arguments:
+ *   sessionFile  — absolute path to the Claude Code session JSONL
+ *   w            — result of computeWasteFactor(sessionFile, cfg)
+ *   cacheReadPct — cache-read share of the current window, 0..100, or null
+ *
+ * Returns null when `w` has no baseline/current (session below minTurns) —
+ * nothing meaningful to emit.
+ */
+function buildPressurePayload(sessionFile, w, cacheReadPct) {
+  if (!w || !w.baseline || !w.current) return null;
+  const sessionId = _sessionIdFromFile(sessionFile);
+  return {
+    schema: PRESSURE_SCHEMA,
+    ts: new Date().toISOString(),
+    session_id: sessionId || null,
+    session_file: sessionFile || null,
+    project_dir: process.env.CLAUDE_PROJECT_DIR || process.cwd(),
+    pressure: {
+      factor: w.factor,
+      turn_count: w.turns,
+      baseline_tokens_per_turn: w.baseline,
+      current_tokens_per_turn:  w.current,
+      cache_read_pct: (typeof cacheReadPct === "number") ? cacheReadPct : null,
+    },
+    ttl_seconds: PRESSURE_TTL_S,
+    producer: "entient-spend",
+    producer_version: _producerVersion(),
+  };
+}
+
+function _sessionIdFromFile(p) {
+  if (!p) return null;
+  const base = path.basename(p);
+  const m = base.match(/^([0-9a-f-]{36})\.jsonl$/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Emit the pressure-signal artifact atomically (tmp + rename).  Fail-safe:
+ * any error results in the artifact being untouched, and the function
+ * returns { ok: false, error } rather than raising.  Never throws.
+ */
+function emitPressureSignal(sessionFile, w, cacheReadPct) {
+  try {
+    const payload = buildPressurePayload(sessionFile, w, cacheReadPct);
+    if (!payload) return { ok: false, error: "no_payload:below_minTurns" };
+
+    fs.mkdirSync(ENTIENT_V2_DIR, { recursive: true });
+    const tmp = PRESSURE_SIGNAL + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf8");
+    fs.renameSync(tmp, PRESSURE_SIGNAL);
+    return { ok: true, path: PRESSURE_SIGNAL, payload };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * CLI entry: `node audit.js emit-pressure [<session-file>]` — one-shot
+ * explicit emit.  Intended for smoke-testing the producer and for user
+ * scripting that wants the pressure file to be fresh on demand.  Normal
+ * hookStatus() renders already emit as a side effect.
+ */
+function emitPressureCmd(sessionFileArg) {
+  let sessionFile = sessionFileArg;
+  if (!sessionFile) {
+    const s = currentSessionFile();
+    if (s) sessionFile = s;
+  }
+  if (!sessionFile) {
+    console.error("No session file given and none auto-detected.");
+    console.error("Usage: entient-spend emit-pressure <session.jsonl>");
+    process.exit(2);
+  }
+  const cfg = loadConfig();
+  const w = computeWasteFactor(sessionFile, cfg);
+  // Compute current-window cache-read share — same math the HUD uses.
+  let cacheReadPct = null;
+  try {
+    const { turns: raw } = readSessionTurnsRaw(sessionFile);
+    if (raw.length >= cfg.windowTurns) {
+      const curWin = raw.slice(-cfg.windowTurns);
+      let cr = 0, all4 = 0;
+      for (const t of curWin) {
+        cr   += t.cr;
+        all4 += t.inp + t.cc + t.cr + t.out;
+      }
+      if (all4 > 0) cacheReadPct = Math.round((cr / all4) * 100);
+    }
+  } catch (_) {}
+
+  const res = emitPressureSignal(sessionFile, w, cacheReadPct);
+  if (res.ok) {
+    console.log(`Emitted ${PRESSURE_SIGNAL}`);
+    console.log(JSON.stringify(res.payload, null, 2));
+    process.exit(0);
+  } else {
+    console.error(`Emit failed: ${res.error}`);
+    process.exit(1);
+  }
 }
 
 function getGitBranch(dir) {
@@ -2547,6 +2693,7 @@ function parseArgs() {
     else if (args[i] === "billing")          { opts.command = "billing";           }
     else if (args[i] === "reconcile") { opts.command = "reconcile"; opts.reconcileFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "factor-audit") { opts.command = "factor-audit"; opts.factorAuditFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
+    else if (args[i] === "emit-pressure") { opts.command = "emit-pressure"; opts.emitPressureFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "redundancy") {
       opts.command = "redundancy";
       if (args[i+1] && !args[i+1].startsWith("--")) opts.sessionFile = args[++i];
@@ -4095,6 +4242,7 @@ function main() {
   if (opts.command === "cost-report") { costReportCmd(opts.last); return; }
   if (opts.command === "reconcile") { reconcile(opts.reconcileFile); return; }
   if (opts.command === "factor-audit") { factorAudit(opts.factorAuditFile); return; }
+  if (opts.command === "emit-pressure") { emitPressureCmd(opts.emitPressureFile); return; }
   if (opts.command === "redundancy") { redundancyReport(opts); return; }
   if (opts.command === "gate-stats") { gateStatsCmd(); return; }
   if (opts.command === "hud")       { hud(); return; }
@@ -4145,5 +4293,10 @@ if (require.main === module) {
     inferNextAction,
     getStructuredDirty,
     _readinessCheck,
+    buildPressurePayload,
+    emitPressureSignal,
+    PRESSURE_SIGNAL,
+    PRESSURE_SCHEMA,
+    PRESSURE_TTL_S,
   };
 }
