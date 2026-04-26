@@ -2726,6 +2726,7 @@ function parseArgs() {
     else if (args[i] === "setup")            { opts.command = "setup";             }
     else if (args[i] === "billing")          { opts.command = "billing";           }
     else if (args[i] === "reconcile") { opts.command = "reconcile"; opts.reconcileFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
+    else if (args[i] === "--fixture") { opts.fixture = true; }
     else if (args[i] === "factor-audit") { opts.command = "factor-audit"; opts.factorAuditFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "emit-pressure") { opts.command = "emit-pressure"; opts.emitPressureFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "redundancy") {
@@ -3832,83 +3833,218 @@ function factorAudit(sessionFileArg) {
 // Reads claude-audit-billing.json (from the entient-spend extension export) and cross-references
 // with metering.db to explain every Anthropic email receipt.
 
-function reconcile(exportFile) {
-  const defaultFile = path.join(os.homedir(), "Downloads", "claude-audit-billing.json");
-  const filePath = exportFile || defaultFile;
+// Pure: aggregate raw metering rows into a normalized shape consumed by
+// attributeInvoiceWindow + the gateway summary block. Caller does I/O.
+// Uses spawnSync with the script as a discrete argv element so shell
+// escaping does not eat the multi-line python — the prior execSync pattern
+// silently dropped the query on Windows shells.
+function loadMeteringRows(meteringPath) {
+  if (!meteringPath || !fs.existsSync(meteringPath)) return [];
+  const { spawnSync } = require("child_process");
+  const py = `
+import sqlite3, json, sys
+conn = sqlite3.connect(sys.argv[1])
+rows = conn.execute("""
+  SELECT DATE(timestamp_utc) as d,
+         SUBSTR(timestamp_utc, 12, 2) as h,
+         model,
+         COALESCE(tool_id, '<unknown>') as tool_id,
+         COALESCE(tenant_id, 'unknown') as tenant_id,
+         COALESCE(request_category, '<unknown>') as request_category,
+         SUM(total_tokens) as tok,
+         SUM(cost_usd) as cost,
+         COUNT(*) as calls,
+         MIN(SUBSTR(timestamp_utc, 12, 5)) as first_t,
+         MAX(SUBSTR(timestamp_utc, 12, 5)) as last_t
+  FROM usage WHERE cached=0
+  GROUP BY DATE(timestamp_utc), SUBSTR(timestamp_utc, 12, 2),
+           model, tool_id, tenant_id, request_category
+  ORDER BY d DESC
+""").fetchall()
+print(json.dumps([{'d':r[0],'h':r[1],'model':r[2],'tool_id':r[3],'tenant_id':r[4],
+                   'request_category':r[5],'tok':r[6],'cost':r[7],'calls':r[8],
+                   'first_t':r[9],'last_t':r[10]} for r in rows]))
+`;
+  for (const interp of ["python3", "python"]) {
+    const r = spawnSync(interp, ["-c", py, meteringPath], {
+      encoding: "utf8", timeout: 15000, shell: false,
+    });
+    if (r.status === 0 && r.stdout) {
+      try { return JSON.parse(r.stdout.trim() || "[]"); } catch (_) { /* try next */ }
+    }
+  }
+  return [];
+}
 
-  // Load entient-spend extension export
-  if (!fs.existsSync(filePath)) {
-    console.log("");
-    console.log(bold("  RECONCILE — No export file found"));
-    console.log(`  Expected: ${filePath}`);
-    console.log("");
-    console.log("  Steps to export from the entient-spend extension:");
-    console.log("  1. Open Chrome → click the entient-spend extension icon");
-    console.log("  2. Click  Export to entient-spend");
-    console.log("  3. Save as  claude-audit-billing.json  in your Downloads folder");
-    console.log("  4. Run  node audit.js reconcile  again");
-    console.log("");
-    return;
+// Pure: given an invoice date and aggregated metering rows, return a per-tool /
+// per-tenant / per-model attribution within ±windowDays of the invoice date.
+// timeWindow is restricted to the invoice day itself (not the full window) so
+// the displayed hh:mm range answers "when on the receipt's date".
+function attributeInvoiceWindow(invoiceDate, rows, windowDays) {
+  if (windowDays == null) windowDays = 3;
+  if (!invoiceDate) return null;
+  const center = new Date(invoiceDate);
+  if (isNaN(center.getTime())) return null;
+
+  const dayKey = invoiceDate.slice(0, 10);
+  const inWindowDates = new Set();
+  for (let di = -windowDays; di <= 0; di++) {
+    inWindowDates.add(new Date(center.getTime() + di * 86400000).toISOString().slice(0, 10));
+  }
+  const inWindow = rows.filter(r => inWindowDates.has(r.d));
+  const rangeStart = new Date(center.getTime() - windowDays * 86400000).toISOString().slice(0, 10);
+  const rangeEnd = dayKey;
+
+  if (inWindow.length === 0) {
+    return {
+      totalCost: 0, totalCalls: 0, totalTokens: 0,
+      topTools: [], topTenants: [], topModels: [],
+      timeWindow: null, rangeStart, rangeEnd,
+      coverage: 'none',
+    };
   }
 
+  const accum = (xs, key) => {
+    const m = {};
+    for (const r of xs) {
+      const k = r[key] || 'unknown';
+      if (!m[k]) m[k] = { name: k, cost: 0, calls: 0, tokens: 0 };
+      m[k].cost   += r.cost  || 0;
+      m[k].calls  += r.calls || 0;
+      m[k].tokens += r.tok   || 0;
+    }
+    return Object.values(m).sort((a, b) => b.cost - a.cost);
+  };
+  const topTools   = accum(inWindow, 'tool_id');
+  const topTenants = accum(inWindow, 'tenant_id');
+  const topModels  = accum(inWindow, 'model');
+  const totalCost   = inWindow.reduce((s, r) => s + (r.cost  || 0), 0);
+  const totalCalls  = inWindow.reduce((s, r) => s + (r.calls || 0), 0);
+  const totalTokens = inWindow.reduce((s, r) => s + (r.tok   || 0), 0);
+
+  let timeWindow = null;
+  const onDay = inWindow.filter(r => r.d === dayKey);
+  if (onDay.length > 0) {
+    const firsts = onDay.map(r => r.first_t).filter(Boolean).sort();
+    const lasts  = onDay.map(r => r.last_t).filter(Boolean).sort();
+    if (firsts.length > 0 && lasts.length > 0) {
+      timeWindow = { date: dayKey, first: firsts[0], last: lasts[lasts.length - 1] };
+    }
+  }
+
+  return {
+    totalCost, totalCalls, totalTokens,
+    topTools, topTenants, topModels,
+    timeWindow, rangeStart, rangeEnd,
+    coverage: 'tracked',
+  };
+}
+
+// Pure: synthesize an export shape mimicking the entient-spend Chrome extension
+// output, anchored on real metering activity dates. Lets reconcile run
+// end-to-end without the extension export button. Marks output as synthetic so
+// downstream consumers can disclaim. Does NOT emit untracked-caller estimates.
+function buildFixtureExport(rows) {
+  const exported_at = new Date().toISOString();
+  if (!rows || rows.length === 0) {
+    return { exported_at, synthetic: true, anthropic: { invoices: [], dailyUsage: [] } };
+  }
+  const byDate = {};
+  for (const r of rows) {
+    if (!byDate[r.d]) byDate[r.d] = { cost: 0, tokens: 0 };
+    byDate[r.d].cost   += r.cost || 0;
+    byDate[r.d].tokens += r.tok  || 0;
+  }
+  const dates = Object.keys(byDate).sort();
+  const invoices = [];
+  let cursor = dates[dates.length - 1];
+  let invIdx = 0;
+  const seen = new Set();
+  while (cursor && !seen.has(cursor) && invoices.length < 6) {
+    seen.add(cursor);
+    let windowCost = 0;
+    for (let di = -2; di <= 0; di++) {
+      const d = new Date(new Date(cursor).getTime() + di * 86400000).toISOString().slice(0, 10);
+      if (byDate[d]) windowCost += byDate[d].cost;
+    }
+    if (windowCost > 0) {
+      invoices.push({
+        id: `synth-inv-${String(invIdx).padStart(3, '0')}`,
+        date: cursor,
+        amount: Number(windowCost.toFixed(2)),
+        status: 'synthetic',
+      });
+      invIdx += 1;
+    }
+    const target = new Date(new Date(cursor).getTime() - 14 * 86400000).toISOString().slice(0, 10);
+    const earlier = dates.filter(d => d <= target);
+    cursor = earlier.length > 0 ? earlier[earlier.length - 1] : null;
+  }
+  const dailyUsage = dates.slice(-30).map(d => ({
+    date: d, cost: byDate[d].cost, tokens: byDate[d].tokens, model: 'mixed',
+  }));
+  return { exported_at, synthetic: true, anthropic: { invoices, dailyUsage } };
+}
+
+function reconcile(exportFile, opts) {
+  opts = opts || {};
+  const defaultFile = path.join(os.homedir(), "Downloads", "claude-audit-billing.json");
+  const meteringPath = path.join(os.homedir(), ".entient", "v2", "metering.db");
+  const meteringRows = loadMeteringRows(meteringPath);
+  const meteringAvail = meteringRows.length > 0;
+
   let exportData;
-  try {
-    exportData = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch (e) {
-    console.log(`  Error reading ${filePath}: ${e.message}`);
-    return;
+  let filePath;
+  if (opts.fixture) {
+    exportData = buildFixtureExport(meteringRows);
+    filePath = '<fixture: synthesized from metering.db>';
+  } else {
+    filePath = exportFile || defaultFile;
+    if (!fs.existsSync(filePath)) {
+      console.log("");
+      console.log(bold("  RECONCILE — No export file found"));
+      console.log(`  Expected: ${filePath}`);
+      console.log("");
+      console.log("  Steps to export from the entient-spend extension:");
+      console.log("  1. Open Chrome → click the entient-spend extension icon");
+      console.log("  2. Click  Export to entient-spend");
+      console.log("  3. Save as  claude-audit-billing.json  in your Downloads folder");
+      console.log("  4. Run  node audit.js reconcile  again");
+      console.log("");
+      console.log(`  ${dim("Or run with synthesized data:  entient-spend reconcile --fixture")}`);
+      console.log("");
+      return;
+    }
+    try {
+      exportData = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    } catch (e) {
+      console.log(`  Error reading ${filePath}: ${e.message}`);
+      return;
+    }
   }
 
   const invoices   = (exportData.anthropic && exportData.anthropic.invoices)   || [];
   const dailyUsage = (exportData.anthropic && exportData.anthropic.dailyUsage) || [];
 
-  // Load metering.db if available
-  let meteringRows = [];
-  let meteringAvail = false;
-  const meteringPath = path.join(os.homedir(), ".entient", "v2", "metering.db");
-  if (fs.existsSync(meteringPath)) {
-    try {
-      // Use sqlite3 via child_process if available
-      const { execSync } = require("child_process");
-      const query = `SELECT DATE(timestamp_utc) as d, model, SUM(total_tokens) as tok, SUM(cost_usd) as cost, COUNT(*) as calls FROM usage WHERE cached=0 GROUP BY DATE(timestamp_utc), model ORDER BY d DESC;`;
-      const out = execSync(`python3 -c "
-import sqlite3, json, sys
-conn = sqlite3.connect('${meteringPath.replace(/\\/g, "/")}')
-rows = conn.execute('''${query}''').fetchall()
-print(json.dumps([{'date':r[0],'model':r[1],'tokens':r[2],'cost':r[3],'calls':r[4]} for r in rows]))
-"`, { encoding: "utf8", timeout: 10000 });
-      meteringRows = JSON.parse(out.trim());
-      meteringAvail = true;
-    } catch (_) {
-      meteringAvail = false;
-    }
-  }
-
-  // Group metering rows by date
+  // Group metering rows by date for the gateway summary table at the bottom.
   const meteringByDate = {};
   for (const r of meteringRows) {
-    if (!meteringByDate[r.date]) meteringByDate[r.date] = { cost: 0, tokens: 0, calls: 0, models: {} };
-    meteringByDate[r.date].cost   += r.cost   || 0;
-    meteringByDate[r.date].tokens += r.tokens || 0;
-    meteringByDate[r.date].calls  += r.calls  || 0;
-    if (!meteringByDate[r.date].models[r.model]) meteringByDate[r.date].models[r.model] = 0;
-    meteringByDate[r.date].models[r.model] += r.cost || 0;
+    if (!meteringByDate[r.d]) meteringByDate[r.d] = { cost: 0, tokens: 0, calls: 0, models: {} };
+    meteringByDate[r.d].cost   += r.cost  || 0;
+    meteringByDate[r.d].tokens += r.tok   || 0;
+    meteringByDate[r.d].calls  += r.calls || 0;
+    meteringByDate[r.d].models[r.model] = (meteringByDate[r.d].models[r.model] || 0) + (r.cost || 0);
   }
-
-  // Build daily API cost from metering (running total to find invoice trigger days)
   const allMeteringDates = Object.keys(meteringByDate).sort();
-  let runningGateway = 0;
-  const runningByDate = {};
-  for (const d of allMeteringDates) {
-    runningGateway += meteringByDate[d].cost;
-    runningByDate[d] = runningGateway;
-  }
 
   console.log("");
   console.log(bold("  Entient Spend — RECEIPT RECONCILIATION"));
-  console.log(`  Export: ${filePath}  |  Exported: ${exportData.exported_at || "unknown"}`);
+  const synthTag = exportData.synthetic ? '  ' + dim('[synthetic fixture]') : '';
+  console.log(`  Export: ${filePath}  |  Exported: ${exportData.exported_at || "unknown"}${synthTag}`);
   console.log(`  ${SL}`);
   console.log("");
+
+  const fmtTok = n => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(0) + 'k' : String(n);
 
   // ── Invoices section ──────────────────────────────────────────────────────
   if (invoices.length === 0) {
@@ -3924,34 +4060,44 @@ print(json.dumps([{'date':r[0],'model':r[1],'tokens':r[2],'cost':r[3],'calls':r[
       const status = inv.status ? `  ${dim(inv.status)}` : "";
       console.log(`  ${(inv.id || "?").padEnd(24)}  ${(inv.date || "?").padEnd(12)}  ${amtStr}${status}`);
 
-      // Find matching gateway activity within ±3 days of invoice date
-      if (inv.date && meteringAvail) {
-        const invDate = new Date(inv.date);
-        const windowDays = 3;
-        let windowCost = 0;
-        let windowCalls = 0;
-        const topModels = {};
-        for (let di = -windowDays; di <= 0; di++) {
-          const d = new Date(invDate.getTime() + di * 86400000).toISOString().slice(0, 10);
-          const m = meteringByDate[d];
-          if (m) {
-            windowCost  += m.cost;
-            windowCalls += m.calls;
-            for (const [mdl, c] of Object.entries(m.models)) {
-              topModels[mdl] = (topModels[mdl] || 0) + c;
-            }
-          }
-        }
-        if (windowCost > 0) {
-          const topMdl = Object.entries(topModels).sort((a,b)=>b[1]-a[1])[0];
-          const mdlStr = topMdl ? `  ${dim("top model: " + topMdl[0].replace("claude-","") + " $" + topMdl[1].toFixed(2))}` : "";
-          console.log(`    ${dim("└ ENTIENT gateway ±3d:")}  ${yl("$"+windowCost.toFixed(2))}  ${dim(windowCalls+" calls")}${mdlStr}`);
-        } else {
-          console.log(`    ${dim("└ No ENTIENT gateway activity found ±3d of invoice date")}`);
-        }
-      } else if (!meteringAvail) {
+      if (!inv.date) continue;
+      if (!meteringAvail) {
         console.log(`    ${dim("└ metering.db not found — install ENTIENT gateway to track API calls")}`);
+        continue;
       }
+
+      const att = attributeInvoiceWindow(inv.date, meteringRows, 3);
+      if (!att || att.coverage === 'none') {
+        console.log(`    ${dim("└ No ENTIENT gateway activity found ±3d of invoice date")}`);
+        continue;
+      }
+
+      const winLine = `${att.rangeStart} → ${att.rangeEnd}`;
+      console.log(`    ${dim('└ ENTIENT gateway')}  ${yl('$'+att.totalCost.toFixed(2))}  ${dim(att.totalCalls + ' calls')}  ${dim(winLine)}`);
+
+      for (const tool of att.topTools.slice(0, 3)) {
+        const tkStr = fmtTok(tool.tokens);
+        const nm = (tool.name || '<unknown>').padEnd(28);
+        console.log(`      ${dim('→ ' + nm)}  ${dim(tkStr.padStart(6) + ' tok')}  ${dim('$' + tool.cost.toFixed(2))}`);
+      }
+      const otherTools = att.topTools.slice(3);
+      if (otherTools.length > 0) {
+        const otherCost = otherTools.reduce((s, t) => s + t.cost, 0);
+        const label = ('+' + otherTools.length + ' other tools').padEnd(28);
+        console.log(`      ${dim('→ ' + label)}  ${dim('       ')}  ${dim('$' + otherCost.toFixed(2))}`);
+      }
+
+      const namedTenants = att.topTenants.filter(t => t.name !== 'default' && t.name !== 'unknown');
+      if (namedTenants.length > 0) {
+        const tenantStr = namedTenants.slice(0, 3).map(t => `${t.name} $${t.cost.toFixed(2)}`).join('  ');
+        console.log(`      ${dim('projects: ' + tenantStr)}`);
+      }
+
+      if (att.timeWindow) {
+        console.log(`      ${dim('time window (UTC, on ' + att.timeWindow.date + '): ' + att.timeWindow.first + ' – ' + att.timeWindow.last)}`);
+      }
+
+      console.log(`      ${dim('shown: tracked metering only — see COVERAGE GAPS below for untracked callers')}`);
     }
     console.log("");
   }
@@ -4274,7 +4420,7 @@ function main() {
   if (opts.command === "billing")    { billingReport(opts.last); return; }
   if (opts.command === "count-tokens"){ countTokensCmd({ model: opts.model, text: opts.text, json: opts.json }); return; }
   if (opts.command === "cost-report") { costReportCmd(opts.last); return; }
-  if (opts.command === "reconcile") { reconcile(opts.reconcileFile); return; }
+  if (opts.command === "reconcile") { reconcile(opts.reconcileFile, { fixture: opts.fixture }); return; }
   if (opts.command === "factor-audit") { factorAudit(opts.factorAuditFile); return; }
   if (opts.command === "emit-pressure") { emitPressureCmd(opts.emitPressureFile); return; }
   if (opts.command === "redundancy") { redundancyReport(opts); return; }
@@ -4334,5 +4480,9 @@ if (require.main === module) {
     PRESSURE_SIGNAL_DIR,
     PRESSURE_SCHEMA,
     PRESSURE_TTL_S,
+    reconcile,
+    loadMeteringRows,
+    attributeInvoiceWindow,
+    buildFixtureExport,
   };
 }
