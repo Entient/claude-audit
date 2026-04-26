@@ -1,0 +1,51 @@
+--- a/popup.js
++++ b/popup.js
+@@ -5,6 +5,32 @@
+   const DISMISS_KEY = 'ts_dismissed_until';
+   const STALE_DAYS = 14;
+ 
++  // Export schema contract — frozen, separate from extension manifest version.
++  // Bump when the field set or semantics change in a way that breaks consumers
++  // (today: the entient-spend reconcile command at audit.js).
++  //
++  // entient-spend.export.v1 shape:
++  //   schema:            'entient-spend.export.v1'         (string, required)
++  //   exported_at:       ISO 8601 UTC timestamp            (string, required)
++  //   extension_version: extension manifest version        (string, required)
++  //   history:           [provider scrape entries]         (array, required, may be empty)
++  //   anthropic.invoices: [
++  //     { id:     short identifier or null,
++  //       date:   YYYY-MM-DD,
++  //       amount: USD number (2 decimals),
++  //       status: 'paid' | 'pending' | 'failed' | 'unknown' }
++  //   ]                                                    (array, required, may be empty)
++  //   anthropic.dailyUsage: [
++  //     { date:   YYYY-MM-DD,
++  //       model:  short model token or null,
++  //       tokens: integer or null,
++  //       cost:   USD number or null }
++  //   ]                                                    (array, required, may be empty)
++  //
++  // Sort order: invoices and dailyUsage both DESC by date.
++  // Unknown top-level keys MUST be ignored by consumers.
++  const EXPORT_SCHEMA = 'entient-spend.export.v1';
++
+   function fmtUSD(n) {
+     if (n === null || n === undefined) return '--';
+     if (n < 0.01 && n > 0) return '<$0.01';
+@@ -119,10 +145,13 @@
+     exportBtn.addEventListener('click', () => {
+       chrome.storage.local.get(null, (allData) => {
+         const exportPayload = {
++          schema: EXPORT_SCHEMA,
+           exported_at: new Date().toISOString(),
+-          version: '2.2.0',
++          extension_version: chrome.runtime.getManifest().version,
++          // Backward-compat alias for any older reconcile build that read `version`.
++          version: chrome.runtime.getManifest().version,
+           history: allData[HISTORY_KEY] || [],
+-          // Flatten Anthropic invoice + daily usage from extra fields for claude-audit reconcile
++          // Flatten Anthropic invoice + daily usage from extra fields for entient-spend reconcile
+           anthropic: {
+             invoices: [],
+             dailyUsage: [],
