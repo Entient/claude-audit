@@ -4135,18 +4135,26 @@ function reconcile(exportFile, opts) {
   }
 
   // ── Coverage gaps ──────────────────────────────────────────────────────────
+  // List is the audited set of known unmetered direct API callers in
+  // entient-interceptor/tools/. The 9-entry list this previously held was
+  // refreshed 2026-04-26: 6 callers now instrumented via tools/_metering.py
+  // (see entient-interceptor 51ac887b), 3 entries were false positives
+  // (matches inside string-literal template generators, not real call
+  // sites). When the list is empty the surrounding language switches to
+  // a closure note.
+  const untracked = [];
   console.log(`  ${SL}`);
   console.log(`  COVERAGE GAPS`);
   console.log(`  ${SL}`);
-  console.log(`  These API callers are NOT logged to metering.db:`);
-  const untracked = [
-    "bulk_synthesize.py", "gpu_worker_notebook.py", "haiku_router.py",
-    "label_worker.py", "lightning_worker.py", "mine_eye_bulk.py",
-    "openclaw_operators.py", "operator_mill.py", "operator_synthesizer.py",
-  ];
-  for (const f of untracked) console.log(`    ${dim("• entient-interceptor/tools/" + f)}`);
-  console.log(`  To close this gap: add _log_to_metering() wrapper to each file.`);
-  console.log(`  Until then, estimated untracked spend: $2-5/month (labeling/synthesis).`);
+  if (untracked.length === 0) {
+    console.log(`  No known direct API callers in entient-interceptor/tools/ are unmetered.`);
+    console.log(`  Residual estimate from any unknown / external sources: $0-2/month.`);
+  } else {
+    console.log(`  These API callers are NOT logged to metering.db:`);
+    for (const f of untracked) console.log(`    ${dim("• entient-interceptor/tools/" + f)}`);
+    console.log(`  To close this gap: add _log_to_metering() wrapper to each file.`);
+    console.log(`  Until then, estimated untracked spend: $2-5/month (labeling/synthesis).`);
+  }
   console.log("");
   console.log(`  ${dim("To get full billing data: visit console.anthropic.com/settings/billing")}`);
   console.log(`  ${dim("and console.anthropic.com/settings/usage while the entient-spend extension is active.")}`);
