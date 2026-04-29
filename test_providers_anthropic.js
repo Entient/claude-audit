@@ -94,6 +94,9 @@ function legacyCalcCost(model, inputTok, outputTok, cacheReadTok, cacheWriteTok)
   return inp + out + cr + cw;
 }
 
+// SHIP_CHECKLIST §7.4: parity loop covers KNOWN models only. Unknown models
+// no longer compare to legacyCalcCost (which silently fell back to Sonnet);
+// they get their own assertions further down.
 const cases = [
   // [model, in, out, cache_read, cache_write]
   ["claude-opus-4",         1_000_000, 200_000,  50_000, 100_000],
@@ -102,20 +105,42 @@ const cases = [
   ["claude-haiku-3",          800_000,  50_000,       0,       0],
   ["claude-opus-3-5",         600_000, 120_000,  20_000,       0],
   ["claudeopus4",             100_000,  10_000,       0,       0], // dashes-stripped match
-  ["unknown-model-xyz",       400_000,  80_000,       0,       0], // hits default
 ];
 
 for (const [model, i, o, cr, cw] of cases) {
   const got = calcCost(model, i, o, cr, cw);
   const exp = legacyCalcCost(model, i, o, cr, cw);
-  t(`calcCost parity: ${model}`, Math.abs(got - exp) < 1e-12, `got=${got} exp=${exp}`);
+  t(`calcCost parity: ${model}`,
+    got && got.unpriced === false && Math.abs(got.cost - exp) < 1e-12,
+    `got=${JSON.stringify(got)} exp=${exp}`);
 }
 
-// ── 6. priceForModel match-logic preserved ──────────────────────────────────
+// ── 6. priceForModel match-logic preserved for known SKUs ───────────────────
 t("priceForModel exact match: claude-haiku-3 → 0.25",      priceForModel("claude-haiku-3").in === 0.25);
 t("priceForModel substring (no dashes): claudeopus4 → 15", priceForModel("claudeopus4").in === 15);
-t("priceForModel default fallback for empty model",        priceForModel("").in === LEGACY_DEFAULT.in);
-t("priceForModel default fallback for unknown",            priceForModel("zzz-unknown").in === LEGACY_DEFAULT.in);
+
+// ── 7. SHIP_CHECKLIST §7.4 — unpriced model handling (no silent fallback) ───
+t("priceForModel returns null for empty model",     priceForModel("") === null);
+t("priceForModel returns null for unknown model",   priceForModel("zzz-unknown") === null);
+t("priceForModel returns null for null input",      priceForModel(null) === null);
+t("priceForModel returns null for undefined input", priceForModel(undefined) === null);
+
+const unkResult = calcCost("zzz-unknown", 400_000, 80_000, 0, 0);
+t("calcCost unknown model: cost is null",           unkResult.cost === null);
+t("calcCost unknown model: unpriced flag is true",  unkResult.unpriced === true);
+t("calcCost unknown model: model echoed",           unkResult.model === "zzz-unknown");
+t("calcCost unknown model: warning shape",          unkResult.warning === "unpriced_model:zzz-unknown");
+
+const emptyResult = calcCost("", 100, 100, 0, 0);
+t("calcCost empty model: cost is null",             emptyResult.cost === null);
+t("calcCost empty model: unpriced flag is true",    emptyResult.unpriced === true);
+t("calcCost empty model: warning labels <empty>",   emptyResult.warning === "unpriced_model:<empty>");
+
+const knownResult = calcCost("claude-haiku-3", 800_000, 50_000, 0, 0);
+t("calcCost known model: cost is finite number",
+  knownResult.cost !== null && typeof knownResult.cost === "number" && Number.isFinite(knownResult.cost));
+t("calcCost known model: unpriced flag is false",   knownResult.unpriced === false);
+t("calcCost known model: no warning emitted",       knownResult.warning === undefined);
 
 // ── Summary ─────────────────────────────────────────────────────────────────
 console.log(`\n  ${pass} pass, ${fail} fail`);

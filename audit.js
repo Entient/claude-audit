@@ -169,6 +169,13 @@ async function setup() {
     console.log("  Key saved anyway — usage data may not be available.\n");
   } else {
     console.log(`OK  (${result.rowCount} usage records found in last 7 days)`);
+    if (result.unpricedModels && result.unpricedModels.length > 0) {
+      // SHIP_CHECKLIST §7.4: surface unpriced models so reconcile is honest
+      // about gaps rather than silently bucketing them to Sonnet pricing.
+      console.log(`  ${yl("Warning:")} ${result.unpricedModels.length} model id(s) used in the last 7 days are not in providers/prices.json:`);
+      for (const m of result.unpricedModels) console.log(`    ${dim("• unpriced_model:" + m)}`);
+      console.log(`  ${dim("Their token usage was tracked but excluded from cost totals. Add the SKU to providers/prices.json to include them.")}`);
+    }
   }
 
   const budgetStr = await ask(`  Monthly budget / what you pay Anthropic ($)${cfg.monthlyBudget ? ` [${cfg.monthlyBudget}]` : ""}: `);

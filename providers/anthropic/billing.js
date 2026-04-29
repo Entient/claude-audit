@@ -21,6 +21,17 @@ const path = require("path");
 //
 // Lazy + cached. If the JSON cannot be read/parsed we fall back to the legacy
 // hardcoded values so a corrupted file never breaks billing fetch.
+//
+// SHIP_CHECKLIST §7.4 / audit gap #4 (2026-04-29): the prior policy was to
+// fall back to a Sonnet-tier `_DEFAULT` for unmatched model IDs. That
+// silently underbills any future Anthropic SKU priced above Sonnet (e.g. an
+// Opus successor) by treating it as Sonnet on the reconcile path. Policy
+// change: unknown model → `priceForModel` returns null, `calcCost` returns
+// `{ cost: null, unpriced: true, warning: "unpriced_model:<id>" }`, and
+// `fetchUsage` excludes unpriced rows from totals while surfacing the gap
+// via `unpricedModels` + `warnings` on the return shape. `_DEFAULT` and
+// `LEGACY_DEFAULT` remain loaded for prices.json schema/parity-test
+// continuity but are no longer consulted by the reconcile path.
 let _PRICES = null;
 let _DEFAULT = null;
 
@@ -34,7 +45,7 @@ const LEGACY_PRICES = {
   "claude-sonnet-3-5":     { in: 3,     out: 15   },
   "claude-haiku-3":        { in: 0.25,  out: 1.25 },
 };
-const LEGACY_DEFAULT = { in: 3, out: 15 };
+const LEGACY_DEFAULT = { in: 3, out: 15 };  // Dormant — not consulted by priceForModel.
 
 function _loadPriceTable() {
   if (_PRICES !== null) return;
@@ -61,16 +72,29 @@ function priceForModel(modelId) {
     if (modelId && modelId.toLowerCase().includes(k.replace(/-/g, ""))) return v;
     if (modelId && modelId.toLowerCase().startsWith(k)) return v;
   }
-  return _DEFAULT;
+  return null;  // Unknown model — no silent fallback. See header comment.
 }
 
+// Returns { cost, unpriced, model, warning? }.
+//   Known model:   { cost: number, unpriced: false, model }
+//   Unknown model: { cost: null,   unpriced: true,  model, warning: "unpriced_model:<id>" }
+// Callers must check `unpriced` and exclude from totals when true.
 function calcCost(model, inputTok, outputTok, cacheReadTok, cacheWriteTok) {
   const p = priceForModel(model);
+  const modelLabel = model || "<empty>";
+  if (p === null) {
+    return {
+      cost: null,
+      unpriced: true,
+      model: modelLabel,
+      warning: `unpriced_model:${modelLabel}`,
+    };
+  }
   const inp  = (inputTok      || 0) / 1_000_000 * p.in;
   const out  = (outputTok     || 0) / 1_000_000 * p.out;
   const cr   = (cacheReadTok  || 0) / 1_000_000 * (p.in * 0.1);
   const cw   = (cacheWriteTok || 0) / 1_000_000 * (p.in * 1.25);
-  return inp + out + cr + cw;
+  return { cost: inp + out + cr + cw, unpriced: false, model: modelLabel };
 }
 
 // ── /v1/usage ───────────────────────────────────────────────────────────────
@@ -131,6 +155,7 @@ async function fetchUsage(apiKey, days = 30) {
 
     const byDay = {};
     let totalCost = 0;
+    const unpricedSet = new Set();
 
     for (const row of allRows) {
       const date = (row.date || row.timestamp || "").slice(0, 10);
@@ -149,17 +174,29 @@ async function fetchUsage(apiKey, days = 30) {
       byDay[date].cacheRead    += cr;
       byDay[date].cacheWrite   += cw;
 
-      const rowCost = calcCost(model, inp, out, cr, cw);
-      byDay[date].cost += rowCost;
-      totalCost        += rowCost;
+      const result = calcCost(model, inp, out, cr, cw);
+      if (result.unpriced) {
+        // SHIP_CHECKLIST §7.4: do NOT silently price into totals. Track the
+        // model so the reconcile surface can warn the operator that real
+        // spend exists for it but pricing is unknown.
+        unpricedSet.add(result.model);
+        if (!byDay[date].models[model]) byDay[date].models[model] = { tokens: 0, cost: 0, unpriced: true };
+        byDay[date].models[model].tokens += inp + out;
+        byDay[date].models[model].unpriced = true;
+        continue;
+      }
+      byDay[date].cost += result.cost;
+      totalCost        += result.cost;
 
       if (!byDay[date].models[model]) byDay[date].models[model] = { tokens: 0, cost: 0 };
       byDay[date].models[model].tokens += inp + out;
-      byDay[date].models[model].cost   += rowCost;
+      byDay[date].models[model].cost   += result.cost;
     }
 
     const days_arr = Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date));
-    return { ok: true, days: days_arr, totalCost, rowCount: allRows.length };
+    const unpricedModels = Array.from(unpricedSet).sort();
+    const warnings = unpricedModels.map(m => `unpriced_model:${m}`);
+    return { ok: true, days: days_arr, totalCost, rowCount: allRows.length, unpricedModels, warnings };
 
   } catch (err) {
     return { ok: false, error: err.message };
