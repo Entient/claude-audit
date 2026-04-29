@@ -176,6 +176,12 @@ async function setup() {
       for (const m of result.unpricedModels) console.log(`    ${dim("• unpriced_model:" + m)}`);
       console.log(`  ${dim("Their token usage was tracked but excluded from cost totals. Add the SKU to providers/prices.json to include them.")}`);
     }
+    if (result.truncated) {
+      // SHIP_CHECKLIST §7.5: do not silently truncate. Surface the cap-hit so
+      // the operator knows the totals are partial and can narrow the window.
+      console.log(`  ${yl("WARNING:")} Usage results may be incomplete; pagination safety cap hit after ${result.pages_fetched} pages. Narrow the date window.`);
+      if (result.hint) console.log(`  ${dim(result.hint)}`);
+    }
   }
 
   const budgetStr = await ask(`  Monthly budget / what you pay Anthropic ($)${cfg.monthlyBudget ? ` [${cfg.monthlyBudget}]` : ""}: `);

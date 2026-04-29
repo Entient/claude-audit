@@ -47,6 +47,14 @@ const LEGACY_PRICES = {
 };
 const LEGACY_DEFAULT = { in: 3, out: 15 };  // Dormant — not consulted by priceForModel.
 
+// SHIP_CHECKLIST §7.5 — explicit pagination safety cap. The prior literal
+// `page < 20` truncated /v1/usage results silently when an account had >20
+// pages of activity in the requested window. Policy: stop after
+// MAX_USAGE_PAGES, but return partial data with truncated=true,
+// pages_fetched=MAX_USAGE_PAGES, and a hint pointing the operator at a
+// narrower --last window. Warn-and-continue, not hard-error.
+const MAX_USAGE_PAGES = 100;
+
 function _loadPriceTable() {
   if (_PRICES !== null) return;
   try {
@@ -147,7 +155,9 @@ async function fetchUsage(apiKey, days = 30) {
       allRows.push(...rows);
       nextPage = data.next_page || data.next_cursor || null;
       page++;
-    } while (nextPage && page < 20);
+    } while (nextPage && page < MAX_USAGE_PAGES);
+
+    const truncated = nextPage != null && page >= MAX_USAGE_PAGES;
 
     if (allRows.length === 0) {
       return { ok: false, error: "No usage data returned. Your API key may not have billing read access." };
@@ -196,7 +206,21 @@ async function fetchUsage(apiKey, days = 30) {
     const days_arr = Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date));
     const unpricedModels = Array.from(unpricedSet).sort();
     const warnings = unpricedModels.map(m => `unpriced_model:${m}`);
-    return { ok: true, days: days_arr, totalCost, rowCount: allRows.length, unpricedModels, warnings };
+    const hint = truncated
+      ? "Usage results hit the pagination safety cap; narrow the date window with --last 7d or a smaller range."
+      : null;
+    if (truncated) warnings.push(`pagination_truncated:max_pages=${MAX_USAGE_PAGES}`);
+    return {
+      ok: true,
+      days: days_arr,
+      totalCost,
+      rowCount: allRows.length,
+      unpricedModels,
+      warnings,
+      truncated,
+      pages_fetched: page,
+      hint,
+    };
 
   } catch (err) {
     return { ok: false, error: err.message };
@@ -313,5 +337,5 @@ module.exports = {
   fetchCostReport,
   countTokens,
   // Internals exposed for parity tests only — not part of the provider contract.
-  _internals: { priceForModel, calcCost, LEGACY_PRICES, LEGACY_DEFAULT },
+  _internals: { priceForModel, calcCost, LEGACY_PRICES, LEGACY_DEFAULT, MAX_USAGE_PAGES },
 };

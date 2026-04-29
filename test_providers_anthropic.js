@@ -142,6 +142,86 @@ t("calcCost known model: cost is finite number",
 t("calcCost known model: unpriced flag is false",   knownResult.unpriced === false);
 t("calcCost known model: no warning emitted",       knownResult.warning === undefined);
 
-// ── Summary ─────────────────────────────────────────────────────────────────
-console.log(`\n  ${pass} pass, ${fail} fail`);
-process.exit(fail === 0 ? 0 : 1);
+// ── 8. SHIP_CHECKLIST §7.5 — pagination safety cap surface ─────────────────
+// Verifies the truncated / pages_fetched / hint return shape and the
+// pagination_truncated warning. Mocks https.request so no real network.
+const https = require("https");
+const origRequest = https.request;
+const { MAX_USAGE_PAGES } = ap._internals;
+
+t("MAX_USAGE_PAGES exposed on _internals",
+  typeof MAX_USAGE_PAGES === "number" && MAX_USAGE_PAGES === 100);
+
+function mockHttps(pages) {
+  let idx = 0;
+  https.request = function (_url, _opts, cb) {
+    const i = idx++;
+    const page = pages[i] || { rows: [], next_page: null };
+    const body = JSON.stringify({
+      data: page.rows || [],
+      next_page: page.next_page || null,
+    });
+    return {
+      on: () => {},
+      end: () => {
+        setImmediate(() => {
+          cb({
+            statusCode: 200,
+            on(event, h) {
+              if (event === "data") setImmediate(() => h(body));
+              else if (event === "end") setImmediate(h);
+            },
+          });
+        });
+      },
+    };
+  };
+}
+function restoreHttps() { https.request = origRequest; }
+
+const today = new Date().toISOString().slice(0, 10);
+function mkRow() {
+  return { date: today, model: "claude-haiku-3", input_tokens: 1000, output_tokens: 500 };
+}
+
+(async () => {
+  // ── Case A: no truncation ────────────────────────────────────────────────
+  mockHttps([
+    { rows: [mkRow()], next_page: "p2" },
+    { rows: [mkRow()], next_page: "p3" },
+    { rows: [mkRow()], next_page: null },
+  ]);
+  const aRes = await ap.fetchUsage("dummy-key", 7);
+  restoreHttps();
+
+  t("no-trunc: ok=true",          aRes.ok === true);
+  t("no-trunc: truncated=false",  aRes.truncated === false);
+  t("no-trunc: pages_fetched=3",  aRes.pages_fetched === 3);
+  t("no-trunc: hint=null",        aRes.hint === null);
+  t("no-trunc: no pagination_truncated warning",
+    Array.isArray(aRes.warnings) && aRes.warnings.every(w => !w.startsWith("pagination_truncated")));
+
+  // ── Case B: cap hit ──────────────────────────────────────────────────────
+  // Feed 101 pages, every page sets next_page so the loop only exits via cap.
+  const bigPages = [];
+  for (let i = 0; i < 101; i++) {
+    bigPages.push({ rows: [mkRow()], next_page: `p${i + 1}` });
+  }
+  mockHttps(bigPages);
+  const bRes = await ap.fetchUsage("dummy-key", 7);
+  restoreHttps();
+
+  t("cap-hit: ok=true",                       bRes.ok === true);
+  t("cap-hit: truncated=true",                bRes.truncated === true);
+  t("cap-hit: pages_fetched=MAX_USAGE_PAGES", bRes.pages_fetched === MAX_USAGE_PAGES);
+  t("cap-hit: hint is non-empty string",
+    typeof bRes.hint === "string" && bRes.hint.length > 0);
+  t("cap-hit: hint starts with expected prefix",
+    typeof bRes.hint === "string" && bRes.hint.startsWith("Usage results hit the pagination safety cap"));
+  t("cap-hit: warnings includes pagination_truncated entry",
+    Array.isArray(bRes.warnings) && bRes.warnings.some(w => w.startsWith("pagination_truncated:max_pages=100")));
+
+  // ── Summary ───────────────────────────────────────────────────────────────
+  console.log(`\n  ${pass} pass, ${fail} fail`);
+  process.exit(fail === 0 ? 0 : 1);
+})();
