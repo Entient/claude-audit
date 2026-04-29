@@ -7,6 +7,7 @@
 const {
   attributeInvoiceWindow,
   buildFixtureExport,
+  computeResidualCoverage,
 } = require("./audit.js");
 
 let pass = 0, fail = 0;
@@ -137,6 +138,77 @@ const sampleRows = [
   t("fixture invoices ≤ 6",                    ex.anthropic.invoices.length <= 6);
   const dates = ex.anthropic.invoices.map(i => i.date);
   t("fixture invoice dates unique",            new Set(dates).size === dates.length);
+}
+
+// ── computeResidualCoverage: SHIP_CHECKLIST §7.7 — per-invoice residual ──────
+// Pure helper. Threshold is strict >5% on raw pct; warning string carries
+// the rounded (1-decimal) pct. Negative residual never warns. Synthetic
+// fixture suppresses warning but the numeric output is unchanged.
+
+// 5.0% residual: at the strict-> boundary, no warning.
+{
+  const r = computeResidualCoverage(100, 95);
+  t("residual 5.0%: residual_amt = 5",        Math.abs(r.residual_amt - 5) < 1e-9);
+  t("residual 5.0%: residual_pct = 5",        r.residual_pct === 5);
+  t("residual 5.0%: warning is null (>5 strict)", r.warning === null);
+}
+
+// 5.1% residual: just over boundary, warning present with rounded pct.
+{
+  const r = computeResidualCoverage(100, 94.9);
+  t("residual 5.1%: residual_pct = 5.1",      r.residual_pct === 5.1);
+  t("residual 5.1%: warning = RESIDUAL_HIGH:5.1", r.warning === "RESIDUAL_HIGH:5.1");
+}
+
+// 50% residual: warning fires with integer-display pct (no trailing .0).
+{
+  const r = computeResidualCoverage(100, 50);
+  t("residual 50%: residual_amt = 50",        r.residual_amt === 50);
+  t("residual 50%: residual_pct = 50",        r.residual_pct === 50);
+  t("residual 50%: warning = RESIDUAL_HIGH:50", r.warning === "RESIDUAL_HIGH:50");
+}
+
+// Negative residual (over-attribution / discount): renders, never warns.
+{
+  const r = computeResidualCoverage(100, 150);
+  t("negative residual: residual_amt = -50",  r.residual_amt === -50);
+  t("negative residual: residual_pct = -50",  r.residual_pct === -50);
+  t("negative residual: no warning",          r.warning === null);
+}
+
+// invoiceAmount null → cannot compute, returns null.
+{
+  t("invoiceAmount null → null",              computeResidualCoverage(null, 50) === null);
+  t("invoiceAmount undefined → null",         computeResidualCoverage(undefined, 50) === null);
+}
+
+// invoiceAmount 0 → cannot compute (would div-by-zero), returns null.
+{
+  t("invoiceAmount 0 → null",                 computeResidualCoverage(0, 50) === null);
+}
+
+// attributedTotal null/undefined → treated as 0; full invoice is residual.
+{
+  const rNull = computeResidualCoverage(100, null);
+  t("attributedTotal null → residual_amt = 100", rNull.residual_amt === 100);
+  t("attributedTotal null → residual_pct = 100", rNull.residual_pct === 100);
+  t("attributedTotal null → warning RESIDUAL_HIGH:100",
+    rNull.warning === "RESIDUAL_HIGH:100");
+
+  const rUndef = computeResidualCoverage(100, undefined);
+  t("attributedTotal undefined → residual_amt = 100", rUndef.residual_amt === 100);
+  t("attributedTotal undefined → warning RESIDUAL_HIGH:100",
+    rUndef.warning === "RESIDUAL_HIGH:100");
+}
+
+// Synthetic fixture: numeric output unchanged, warning suppressed.
+{
+  const live  = computeResidualCoverage(100, 50, { synthetic: false });
+  const synth = computeResidualCoverage(100, 50, { synthetic: true });
+  t("synthetic=false: warning fires",         live.warning === "RESIDUAL_HIGH:50");
+  t("synthetic=true: residual_amt unchanged", synth.residual_amt === 50);
+  t("synthetic=true: residual_pct unchanged", synth.residual_pct === 50);
+  t("synthetic=true: warning suppressed",     synth.warning === null);
 }
 
 // ── Summary ──────────────────────────────────────────────────────────────────

@@ -3723,6 +3723,30 @@ function attributeInvoiceWindow(invoiceDate, rows, lookbackDays) {
   };
 }
 
+// Pure: per-invoice residual = invoiceAmount - attributedTotal, rounded pct.
+// SHIP_CHECKLIST §7.7. Warning fires only when the gap is positive AND raw
+// pct strictly > 5; negative residual (over-attribution / discount / credit)
+// is rendered but never warned. opts.synthetic=true suppresses the warning
+// but does not affect the numeric output (caller still renders the line).
+//   invoiceAmount null/undefined or 0  → returns null (cannot compute)
+//   attributedTotal null/undefined     → treated as 0
+//   attributedTotal NaN/non-finite     → treated as 0
+function computeResidualCoverage(invoiceAmount, attributedTotal, opts) {
+  if (invoiceAmount == null) return null;
+  const inv = Number(invoiceAmount);
+  if (!Number.isFinite(inv) || inv === 0) return null;
+  const attRaw = attributedTotal == null ? 0 : Number(attributedTotal);
+  const attSafe = Number.isFinite(attRaw) ? attRaw : 0;
+  const residual_amt = inv - attSafe;
+  const raw_pct = (residual_amt / inv) * 100;
+  const residual_pct = Math.round(raw_pct * 10) / 10;
+  const synthetic = !!(opts && opts.synthetic);
+  const warning = (residual_amt > 0 && raw_pct > 5 && !synthetic)
+    ? `RESIDUAL_HIGH:${residual_pct}`
+    : null;
+  return { residual_amt, residual_pct, warning };
+}
+
 // Pure: synthesize an export shape mimicking the entient-spend Chrome extension
 // output, anchored on real metering activity dates. Lets reconcile run
 // end-to-end without the extension export button. Marks output as synthetic so
@@ -3881,6 +3905,18 @@ function reconcile(exportFile, opts) {
         console.log(`      ${dim('time window (UTC, on ' + att.timeWindow.date + '): ' + att.timeWindow.first + ' – ' + att.timeWindow.last)}`);
       }
 
+      // SHIP_CHECKLIST §7.7: per-invoice residual = inv.amount - att.totalCost.
+      const resid = computeResidualCoverage(inv.amount, att.totalCost, { synthetic: !!exportData.synthetic });
+      if (resid) {
+        const sign = resid.residual_amt < 0 ? '-' : '';
+        const absAmt = Math.abs(resid.residual_amt).toFixed(2);
+        const tag = resid.residual_amt < 0 ? 'over-attributed' : 'unattributed';
+        console.log(`      ${dim(`Residual: ${sign}$${absAmt} (${resid.residual_pct}%) ${tag}`)}`);
+        if (resid.warning) {
+          console.log(`      ${yl(`WARNING (${resid.warning}):`)} ${dim('>5% of invoice unattributed.')}`);
+        }
+      }
+
       console.log(`      ${dim('shown: tracked metering only — see COVERAGE GAPS below for untracked callers')}`);
     }
     console.log("");
@@ -3932,7 +3968,6 @@ function reconcile(exportFile, opts) {
   console.log(`  ${SL}`);
   if (untracked.length === 0) {
     console.log(`  No known direct API callers in entient-interceptor/tools/ are unmetered.`);
-    console.log(`  Residual estimate from any unknown / external sources: $0-2/month.`);
   } else {
     console.log(`  These API callers are NOT logged to metering.db:`);
     for (const f of untracked) console.log(`    ${dim("• entient-interceptor/tools/" + f)}`);
@@ -4276,5 +4311,6 @@ if (require.main === module) {
     loadMeteringRows,
     attributeInvoiceWindow,
     buildFixtureExport,
+    computeResidualCoverage,
   };
 }
