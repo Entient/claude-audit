@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "_note": "Slice 1 of V2 provider extraction. Prices lifted verbatim from audit.js fetchAnthropicUsage PRICES table. Units: $/Mtok. Cache-read multiplier 0.10 of input rate; cache-write multiplier 1.25 of input rate (applied at cost-calc time, not stored per-row).",
+  "rows": [
+    { "provider": "anthropic", "model": "claude-opus-4",     "in": 15,    "out": 75,   "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-sonnet-4",   "in": 3,     "out": 15,   "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-sonnet-4-5", "in": 3,     "out": 15,   "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-haiku-4",    "in": 0.80,  "out": 4,    "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-haiku-4-5",  "in": 0.80,  "out": 4,    "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-opus-3-5",   "in": 15,    "out": 75,   "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-sonnet-3-5", "in": 3,     "out": 15,   "effective_from": "1970-01-01" },
+    { "provider": "anthropic", "model": "claude-haiku-3",    "in": 0.25,  "out": 1.25, "effective_from": "1970-01-01" }
+  ],
+  "defaults": {
+    "anthropic": { "in": 3, "out": 15 }
+  }
+}

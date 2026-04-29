@@ -8,6 +8,15 @@
   "scripts": {
     "start": "node audit.js"
   },
+  "files": [
+    "audit.js",
+    "gate_adapter.js",
+    "providers/",
+    "README.md",
+    "LICENSE",
+    "MIGRATION.md",
+    "package.json"
+  ],
   "keywords": ["entient", "spend", "reconcile", "billing", "anthropic", "llm-cost", "metering", "hooks"],
   "author": "Entient",
   "license": "MIT",
