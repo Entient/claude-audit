@@ -1,7 +1,7 @@
 {
   "name": "@entient/spend",
   "version": "0.1.0",
-  "description": "Entient Spend — AI spend reconciliation. Cross-references Anthropic billing exports with local metering to attribute every invoice dollar to a tool, project, and day. Pairs with the entient-spend Chrome extension.",
+  "description": "Entient Spend — AI spend visibility for Claude Code. Reconciliation-grade cost reports from the Anthropic Admin API (/v1/organizations/cost_report), plus an advisory pressure-signal report from local metering for spotting runaway sessions and attributing tracked usage to project / tool / day.",
   "bin": {
     "entient-spend": "./audit.js"
   },
@@ -17,7 +17,7 @@
     "MIGRATION.md",
     "package.json"
   ],
-  "keywords": ["entient", "spend", "reconcile", "billing", "anthropic", "llm-cost", "metering", "hooks"],
+  "keywords": ["entient", "spend", "cost-report", "anthropic", "llm-cost", "metering", "advisory", "pressure-signal", "estimate", "hooks"],
   "author": "Entient",
   "license": "MIT",
   "engines": {

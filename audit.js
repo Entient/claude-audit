@@ -3815,7 +3815,8 @@ function reconcile(exportFile, opts) {
   const allMeteringDates = Object.keys(meteringByDate).sort();
 
   console.log("");
-  console.log(bold("  Entient Spend — RECEIPT RECONCILIATION"));
+  console.log(bold("  Entient Spend — advisory receipt estimate"));
+  console.log(dim("  Token-estimated from local metering. Not invoice truth — use 'entient-spend cost-report' for billed dollars."));
   const synthTag = exportData.synthetic ? '  ' + dim('[synthetic fixture]') : '';
   console.log(`  Export: ${filePath}  |  Exported: ${exportData.exported_at || "unknown"}${synthTag}`);
   console.log(`  ${SL}`);
