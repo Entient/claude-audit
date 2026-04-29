@@ -3646,22 +3646,23 @@ print(json.dumps([{'d':r[0],'h':r[1],'model':r[2],'tool_id':r[3],'tenant_id':r[4
 }
 
 // Pure: given an invoice date and aggregated metering rows, return a per-tool /
-// per-tenant / per-model attribution within ±windowDays of the invoice date.
+// per-tenant / per-model attribution covering `lookbackDays` before the invoice
+// date through the invoice date itself (inclusive lookback, no forward window).
 // timeWindow is restricted to the invoice day itself (not the full window) so
 // the displayed hh:mm range answers "when on the receipt's date".
-function attributeInvoiceWindow(invoiceDate, rows, windowDays) {
-  if (windowDays == null) windowDays = 3;
+function attributeInvoiceWindow(invoiceDate, rows, lookbackDays) {
+  if (lookbackDays == null) lookbackDays = 3;
   if (!invoiceDate) return null;
   const center = new Date(invoiceDate);
   if (isNaN(center.getTime())) return null;
 
   const dayKey = invoiceDate.slice(0, 10);
   const inWindowDates = new Set();
-  for (let di = -windowDays; di <= 0; di++) {
+  for (let di = -lookbackDays; di <= 0; di++) {
     inWindowDates.add(new Date(center.getTime() + di * 86400000).toISOString().slice(0, 10));
   }
   const inWindow = rows.filter(r => inWindowDates.has(r.d));
-  const rangeStart = new Date(center.getTime() - windowDays * 86400000).toISOString().slice(0, 10);
+  const rangeStart = new Date(center.getTime() - lookbackDays * 86400000).toISOString().slice(0, 10);
   const rangeEnd = dayKey;
 
   if (inWindow.length === 0) {
@@ -3837,7 +3838,7 @@ function reconcile(exportFile, opts) {
 
       const att = attributeInvoiceWindow(inv.date, meteringRows, 3);
       if (!att || att.coverage === 'none') {
-        console.log(`    ${dim("└ No ENTIENT gateway activity found ±3d of invoice date")}`);
+        console.log(`    ${dim("└ No ENTIENT gateway activity found in 3d lookback before invoice date")}`);
         continue;
       }
 
