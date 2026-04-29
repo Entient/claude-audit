@@ -2509,6 +2509,7 @@ function parseArgs() {
     else if (args[i] === "billing")          { opts.command = "billing";           }
     else if (args[i] === "reconcile") { opts.command = "reconcile"; opts.reconcileFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "--fixture") { opts.fixture = true; }
+    else if (args[i] === "--estimate") { opts.estimate = true; }
     else if (args[i] === "factor-audit") { opts.command = "factor-audit"; opts.factorAuditFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "emit-pressure") { opts.command = "emit-pressure"; opts.emitPressureFile = args[i+1] && !args[i+1].startsWith("--") ? args[++i] : null; }
     else if (args[i] === "redundancy") {
@@ -2558,6 +2559,25 @@ const C = {
 const bold   = s => `${C.bold}${s}${C.reset}`;
 const dim    = s => `${C.dim}${s}${C.reset}`;
 const yl     = s => `${C.yellow}${s}${C.reset}`;   // yellow — key numbers only
+
+// SHIP_CHECKLIST §7.8 — token-priced $ figures on advisory surfaces are
+// fenced behind --estimate. Default render replaces $ with a tokens / calls
+// fallback so token-estimated dollars cannot be mistaken for invoice truth.
+// cost-report (Admin API) is authoritative and does NOT use this helper.
+//   amount      number | null — the token-priced $ value, or null when missing
+//   isEstimate  boolean       — true iff the operator passed --estimate
+//   fallback    string        — what to render in default (non-estimate) mode
+//   decimals    number        — toFixed(decimals) when rendering (default 2)
+function fmtEstUsd(amount, isEstimate, fallback, decimals) {
+  if (!isEstimate) return fallback != null ? fallback : "—";
+  if (amount == null) return "$?.??";
+  const d = typeof decimals === "number" ? decimals : 2;
+  return "$" + Number(amount).toFixed(d);
+}
+
+const ADVISORY_ESTIMATE_BANNER =
+  "Estimate only: token-priced figures may drift ±10–15% from invoices. " +
+  "Use 'entient-spend cost-report' for billed dollars.";
 // keep these as no-ops so existing code that calls them still compiles
 const red    = s => s;
 const yellow = s => yl(s);
@@ -3273,7 +3293,13 @@ async function countTokensCmd(opts) {
 
 // ── cost-report command ────────────────────────────────────────────────────
 // Authoritative $ figures from the Admin API. Requires apikey_... or sk-ant-admin...
-async function costReportCmd(windowStr = "30d") {
+async function costReportCmd(windowStr = "30d", opts) {
+  opts = opts || {};
+  if (opts.estimate) {
+    // SHIP_CHECKLIST §7.8: cost-report is the authoritative surface; the
+    // --estimate flag has no meaning here. Note it, do not change behavior.
+    process.stderr.write("--estimate ignored: cost-report uses Anthropic Admin API billed dollars.\n");
+  }
   const cfg = loadConfig();
   if (!cfg.anthropicAdminKey) {
     console.log(`\n  ${yl("No admin key configured.")} Run: entient-spend setup`);
@@ -3392,15 +3418,22 @@ async function menu() {
   }
 }
 
-function billingReport(windowStr = "30d") {
+function billingReport(windowStr = "30d", opts) {
+  opts = opts || {};
+  const isEstimate = !!opts.estimate;
   const cfg    = loadConfig();
   const { since } = parseWindow(windowStr);
   const b      = computeTokenBilling(since);
   const budget = cfg.monthlyBudget || null;
 
   console.log("");
-  console.log(bold(`  Entient Spend — BILLING RECONCILIATION`));
-  console.log(`  Last ${windowStr}  |  Based on session token counts at Anthropic API rates`);
+  console.log(bold(`  Entient Spend — billing (advisory estimate)`));
+  console.log(`  Last ${windowStr}  |  Token-priced from local session JSONLs (advisory)`);
+  if (isEstimate) {
+    console.log(yl("  " + ADVISORY_ESTIMATE_BANNER));
+  } else {
+    console.log(dim("  Token-priced $ figures suppressed; pass --estimate to render them."));
+  }
   console.log(`  ${SL}`);
   console.log("");
 
@@ -3412,16 +3445,25 @@ function billingReport(windowStr = "30d") {
   }
 
   const total = b.totalCost;
+  const totalTok = b.days ? b.days.reduce((s, d) => s + ((d.tokens || 0)), 0) : 0;
   if (budget) {
     console.log(`  Max plan budget      $${budget.toFixed(2)}/mo`);
-    console.log(`  Estimated usage      ${yl("$" + total.toFixed(2))}`);
-    const overage = Math.max(0, total - budget);
-    if (overage > 0) {
-      console.log(`  Estimated overage    ${yl("$" + overage.toFixed(2))}  ${dim("← this is what Anthropic billed separately")}`);
+    if (isEstimate) {
+      console.log(`  Estimated usage      ${yl("$" + total.toFixed(2))}`);
+      const overage = Math.max(0, total - budget);
+      if (overage > 0) {
+        console.log(`  Estimated overage    ${yl("$" + overage.toFixed(2))}  ${dim("← this is what Anthropic billed separately")}`);
+      }
+    } else {
+      console.log(`  Estimated usage      ${dim("— pass --estimate to render $ figures")}`);
     }
     console.log("");
   } else {
-    console.log(`  Estimated total      ${yl("$" + total.toFixed(2))}`);
+    if (isEstimate) {
+      console.log(`  Estimated total      ${yl("$" + total.toFixed(2))}`);
+    } else {
+      console.log(`  Estimated total      ${dim("— pass --estimate to render $ figures")}`);
+    }
     console.log(`  ${dim("Set your plan cost: entient-spend setup (enter monthly budget)")}`);
     console.log("");
   }
@@ -3434,8 +3476,16 @@ function billingReport(windowStr = "30d") {
   for (const day of b.days) {
     running += day.cost;
     const bar     = "█".repeat(Math.min(Math.round(day.cost / maxDay * 16), 16));
-    const topProj = Object.entries(day.projects).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([k,v])=>`${k} $${v.toFixed(2)}`).join("  ");
-    console.log(`  ${day.date}   ${yl(("$"+day.cost.toFixed(2)).padStart(7))}   ${dim("running: $"+running.toFixed(2).padStart(7))}   ${dim(bar)}   ${dim(topProj)}`);
+    const topProj = isEstimate
+      ? Object.entries(day.projects).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([k,v])=>`${k} $${v.toFixed(2)}`).join("  ")
+      : Object.entries(day.projects).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([k])=>k).join("  ");
+    const cell = isEstimate
+      ? yl(("$"+day.cost.toFixed(2)).padStart(7))
+      : dim(((day.tokens || 0) / 1e3).toFixed(0).padStart(5) + "k tok");
+    const runCell = isEstimate
+      ? dim("running: $"+running.toFixed(2).padStart(7))
+      : "";
+    console.log(`  ${day.date}   ${cell}   ${runCell}   ${dim(bar)}   ${dim(topProj)}`);
   }
   console.log("");
 
@@ -3445,7 +3495,10 @@ function billingReport(windowStr = "30d") {
   for (const p of b.projects) {
     const pct = total > 0 ? Math.round(p.cost / total * 100) : 0;
     const mtok = ((p.tokens) / 1e6).toFixed(1);
-    console.log(`  ${p.name.padEnd(28)}  ${yl(("$"+p.cost.toFixed(2)).padStart(7))}  ${String(pct)+"%"}  ${dim(mtok+"M tok  "+p.sessions+" sessions")}`);
+    const cell = isEstimate
+      ? yl(("$"+p.cost.toFixed(2)).padStart(7))
+      : dim(("").padStart(7));
+    console.log(`  ${p.name.padEnd(28)}  ${cell}  ${String(pct)+"%"}  ${dim(mtok+"M tok  "+p.sessions+" sessions")}`);
   }
   console.log("");
 
@@ -3459,7 +3512,8 @@ function billingReport(windowStr = "30d") {
     console.log(`  ${SL}`);
     console.log(`  Sessions analyzed        ${ss2.sessions}`);
     console.log(`  Avg startup cost         ~${yl(overheadK + "k")} tokens/session  ${dim("(before first prompt)")}`);
-    console.log(`  Total startup tokens     ~${yl(totalK + "k")} tokens  ${dim("= $" + ss2.overheadCost.toFixed(2) + " at Sonnet rates")}`);
+    const overheadDollarTail = isEstimate ? ` = $${ss2.overheadCost.toFixed(2)} at Sonnet rates` : "";
+    console.log(`  Total startup tokens     ~${yl(totalK + "k")} tokens  ${dim(overheadDollarTail)}`);
     console.log(`  ${dim("Fix: entient.com collapses tool loading — first run witnesses it, every run after is free.")}`);
     console.log("");
   }
@@ -3844,9 +3898,16 @@ function reconcile(exportFile, opts) {
   }
   const allMeteringDates = Object.keys(meteringByDate).sort();
 
+  const isEstimate = !!opts.estimate;
+
   console.log("");
   console.log(bold("  Entient Spend — advisory receipt estimate"));
   console.log(dim("  Token-estimated from local metering. Not invoice truth — use 'entient-spend cost-report' for billed dollars."));
+  if (isEstimate) {
+    console.log(yl("  " + ADVISORY_ESTIMATE_BANNER));
+  } else {
+    console.log(dim("  Token-priced $ figures suppressed; pass --estimate to render them."));
+  }
   const synthTag = exportData.synthetic ? '  ' + dim('[synthetic fixture]') : '';
   console.log(`  Export: ${filePath}  |  Exported: ${exportData.exported_at || "unknown"}${synthTag}`);
   console.log(`  ${SL}`);
@@ -3881,23 +3942,35 @@ function reconcile(exportFile, opts) {
       }
 
       const winLine = `${att.rangeStart} → ${att.rangeEnd}`;
-      console.log(`    ${dim('└ ENTIENT gateway')}  ${yl('$'+att.totalCost.toFixed(2))}  ${dim(att.totalCalls + ' calls')}  ${dim(winLine)}`);
+      const gwAmt = isEstimate
+        ? yl(fmtEstUsd(att.totalCost, true))
+        : dim(`${att.totalTokens.toLocaleString()} tok`);
+      console.log(`    ${dim('└ ENTIENT gateway')}  ${gwAmt}  ${dim(att.totalCalls + ' calls')}  ${dim(winLine)}`);
 
       for (const tool of att.topTools.slice(0, 3)) {
         const tkStr = fmtTok(tool.tokens);
         const nm = (tool.name || '<unknown>').padEnd(28);
-        console.log(`      ${dim('→ ' + nm)}  ${dim(tkStr.padStart(6) + ' tok')}  ${dim('$' + tool.cost.toFixed(2))}`);
+        const toolAmt = fmtEstUsd(tool.cost, isEstimate, '');
+        console.log(`      ${dim('→ ' + nm)}  ${dim(tkStr.padStart(6) + ' tok')}  ${dim(toolAmt)}`);
       }
       const otherTools = att.topTools.slice(3);
       if (otherTools.length > 0) {
         const otherCost = otherTools.reduce((s, t) => s + t.cost, 0);
+        const otherTokens = otherTools.reduce((s, t) => s + (t.tokens || 0), 0);
         const label = ('+' + otherTools.length + ' other tools').padEnd(28);
-        console.log(`      ${dim('→ ' + label)}  ${dim('       ')}  ${dim('$' + otherCost.toFixed(2))}`);
+        const otherAmt = isEstimate
+          ? fmtEstUsd(otherCost, true)
+          : fmtTok(otherTokens) + ' tok';
+        console.log(`      ${dim('→ ' + label)}  ${dim('       ')}  ${dim(otherAmt)}`);
       }
 
       const namedTenants = att.topTenants.filter(t => t.name !== 'default' && t.name !== 'unknown');
       if (namedTenants.length > 0) {
-        const tenantStr = namedTenants.slice(0, 3).map(t => `${t.name} $${t.cost.toFixed(2)}`).join('  ');
+        const tenantStr = namedTenants.slice(0, 3).map(t =>
+          isEstimate
+            ? `${t.name} ${fmtEstUsd(t.cost, true)}`
+            : `${t.name} ${fmtTok(t.tokens || 0)} tok`
+        ).join('  ');
         console.log(`      ${dim('projects: ' + tenantStr)}`);
       }
 
@@ -3906,12 +3979,15 @@ function reconcile(exportFile, opts) {
       }
 
       // SHIP_CHECKLIST §7.7: per-invoice residual = inv.amount - att.totalCost.
+      // §7.8: $ amount is rendered only under --estimate; the pct + warning
+      // are structural signals and surface regardless of mode.
       const resid = computeResidualCoverage(inv.amount, att.totalCost, { synthetic: !!exportData.synthetic });
       if (resid) {
         const sign = resid.residual_amt < 0 ? '-' : '';
         const absAmt = Math.abs(resid.residual_amt).toFixed(2);
         const tag = resid.residual_amt < 0 ? 'over-attributed' : 'unattributed';
-        console.log(`      ${dim(`Residual: ${sign}$${absAmt} (${resid.residual_pct}%) ${tag}`)}`);
+        const amtPart = isEstimate ? `${sign}$${absAmt} ` : '';
+        console.log(`      ${dim(`Residual: ${amtPart}(${resid.residual_pct}%) ${tag}`)}`);
         if (resid.warning) {
           console.log(`      ${yl(`WARNING (${resid.warning}):`)} ${dim('>5% of invoice unattributed.')}`);
         }
@@ -3946,11 +4022,19 @@ function reconcile(exportFile, opts) {
       const bar = "█".repeat(Math.min(Math.round(m.cost / 0.5 * 8), 16));
       const topMdl = Object.entries(m.models).sort((a,b)=>b[1]-a[1])[0];
       const mdlStr = topMdl ? dim(topMdl[0].replace("claude-","").slice(0,18)) : "";
-      console.log(`  ${d}   ${yl(("$"+m.cost.toFixed(4)).padStart(9))}   ${dim(m.calls+" calls")}   ${mdlStr}   ${dim(bar)}`);
+      const cell = isEstimate
+        ? yl(("$" + m.cost.toFixed(4)).padStart(9))
+        : dim((m.tokens || 0).toLocaleString().padStart(12) + " tok");
+      console.log(`  ${d}   ${cell}   ${dim(m.calls+" calls")}   ${mdlStr}   ${dim(bar)}`);
     }
     const totalGateway = allMeteringDates.reduce((s, d) => s + meteringByDate[d].cost, 0);
+    const totalTokens  = allMeteringDates.reduce((s, d) => s + (meteringByDate[d].tokens || 0), 0);
     console.log(`  ${SL}`);
-    console.log(`  Total (metering.db, all time):  ${yl("$"+totalGateway.toFixed(2))}`);
+    if (isEstimate) {
+      console.log(`  Total (metering.db, all time):  ${yl("$"+totalGateway.toFixed(2))}`);
+    } else {
+      console.log(`  Total (metering.db, all time):  ${dim(totalTokens.toLocaleString() + " tok  — pass --estimate for $ rendering")}`);
+    }
     console.log("");
   }
 
@@ -4244,10 +4328,10 @@ function main() {
   if (opts.command === "status")    { status();    return; }
   if (opts.command === "doctor")    { doctor();    return; }
   if (opts.command === "setup")     { setup();     return; }
-  if (opts.command === "billing")    { billingReport(opts.last); return; }
+  if (opts.command === "billing")    { billingReport(opts.last, { estimate: !!opts.estimate }); return; }
   if (opts.command === "count-tokens"){ countTokensCmd({ model: opts.model, text: opts.text, json: opts.json }); return; }
-  if (opts.command === "cost-report") { costReportCmd(opts.last); return; }
-  if (opts.command === "reconcile") { reconcile(opts.reconcileFile, { fixture: opts.fixture }); return; }
+  if (opts.command === "cost-report") { costReportCmd(opts.last, { estimate: !!opts.estimate }); return; }
+  if (opts.command === "reconcile") { reconcile(opts.reconcileFile, { fixture: opts.fixture, estimate: !!opts.estimate }); return; }
   if (opts.command === "factor-audit") { factorAudit(opts.factorAuditFile); return; }
   if (opts.command === "emit-pressure") { emitPressureCmd(opts.emitPressureFile); return; }
   if (opts.command === "redundancy") { redundancyReport(opts); return; }
@@ -4312,5 +4396,9 @@ if (require.main === module) {
     attributeInvoiceWindow,
     buildFixtureExport,
     computeResidualCoverage,
+    fmtEstUsd,
+    ADVISORY_ESTIMATE_BANNER,
+    parseArgs,
+    billingReport,
   };
 }
