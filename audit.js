@@ -1484,10 +1484,11 @@ function _claudeLoopScript() {
 
 $flagPath    = Join-Path $HOME ".entient-spend\restart-flag"
 $maxRestarts = 50
+$entientClaude = "C:\Users\Brock1\Desktop\Agent\scripts\claude.bat"
 $restarts    = 0
 
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-    Write-Host "[claude-loop] ERROR: 'claude' not found in PATH." -ForegroundColor Red
+if ((-not (Test-Path $entientClaude)) -and (-not (Get-Command claude -ErrorAction SilentlyContinue))) {
+    Write-Host "[claude-loop] ERROR: ENTIENT wrapper and 'claude' PATH command not found." -ForegroundColor Red
     exit 1
 }
 
@@ -1496,8 +1497,13 @@ Write-Host "[claude-loop] Sessions rotate at context-growth threshold. Context i
 Write-Host ""
 
 while ($restarts -lt $maxRestarts) {
-    # cmd /c handles .cmd shims and inherits the current console (proper interactive TUI)
-    cmd /c claude
+    # Prefer ENTIENT wrapper when present so orchestration preflight always runs.
+    # Fallback keeps older installs working if the Agent checkout wrapper is unavailable.
+    if (Test-Path $entientClaude) {
+        & $entientClaude
+    } else {
+        cmd /c claude
+    }
 
     if (Test-Path $flagPath) {
         Remove-Item $flagPath -Force -ErrorAction SilentlyContinue

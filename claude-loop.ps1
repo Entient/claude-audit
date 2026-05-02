@@ -20,10 +20,11 @@ param(
 $flagPath    = Join-Path $HOME ".entient-spend\restart-flag"
 $contextPath = Join-Path $HOME ".entient-spend\last-session.md"
 $thisScript  = $MyInvocation.MyCommand.Path
+$entientClaude = "C:\Users\Brock1\Desktop\Agent\scripts\claude.bat"
 $restarts    = 0
 
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-    Write-Host "[claude-loop] ERROR: 'claude' not found in PATH." -ForegroundColor Red
+if ((-not (Test-Path $entientClaude)) -and (-not (Get-Command claude -ErrorAction SilentlyContinue))) {
+    Write-Host "[claude-loop] ERROR: ENTIENT wrapper and 'claude' PATH command not found." -ForegroundColor Red
     exit 1
 }
 
@@ -44,9 +45,13 @@ while ($restarts -lt $MaxRestarts) {
     # 4GB old-space leaves room for the Python worker pool on 16GB machines.
     $env:NODE_OPTIONS = "--max-old-space-size=4096"
 
-    # cmd /c: resolves .cmd shims (npm-installed claude) and inherits the current console
-    # so the TUI renders correctly with full color + input
-    cmd /c claude
+    # Prefer ENTIENT wrapper when present so orchestration preflight always runs.
+    # Fallback keeps older installs working if the Agent checkout wrapper is unavailable.
+    if (Test-Path $entientClaude) {
+        & $entientClaude
+    } else {
+        cmd /c claude
+    }
 
     if (Test-Path $flagPath) {
         $flagData = Get-Content $flagPath -Raw -ErrorAction SilentlyContinue
