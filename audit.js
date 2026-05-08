@@ -3675,6 +3675,18 @@ function factorAudit(sessionFileArg) {
 // Reads claude-audit-billing.json (from the entient-spend extension export) and cross-references
 // with metering.db to explain every Anthropic email receipt.
 
+function normalizeUsdToCents(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100);
+}
+
+function centsToUsd(cents) {
+  const n = Number(cents);
+  if (!Number.isFinite(n)) return 0;
+  return n / 100;
+}
+
 // Pure: aggregate raw metering rows into a normalized shape consumed by
 // attributeInvoiceWindow + the gateway summary block. Caller does I/O.
 // Uses spawnSync with the script as a discrete argv element so shell
@@ -3694,7 +3706,7 @@ rows = conn.execute("""
          COALESCE(tenant_id, 'unknown') as tenant_id,
          COALESCE(request_category, '<unknown>') as request_category,
          SUM(total_tokens) as tok,
-         SUM(cost_usd) as cost,
+         SUM(CAST(ROUND(cost_usd * 100) AS INTEGER)) as cost_cents,
          COUNT(*) as calls,
          MIN(SUBSTR(timestamp_utc, 12, 5)) as first_t,
          MAX(SUBSTR(timestamp_utc, 12, 5)) as last_t
@@ -3704,7 +3716,8 @@ rows = conn.execute("""
   ORDER BY d DESC
 """).fetchall()
 print(json.dumps([{'d':r[0],'h':r[1],'model':r[2],'tool_id':r[3],'tenant_id':r[4],
-                   'request_category':r[5],'tok':r[6],'cost':r[7],'calls':r[8],
+                   'request_category':r[5],'tok':r[6],'cost_cents':r[7],
+                   'cost':(r[7] or 0)/100.0,'calls':r[8],
                    'first_t':r[9],'last_t':r[10]} for r in rows]))
 `;
   for (const interp of ["python3", "python"]) {
@@ -3740,28 +3753,36 @@ function attributeInvoiceWindow(invoiceDate, rows, lookbackDays) {
 
   if (inWindow.length === 0) {
     return {
-      totalCost: 0, totalCalls: 0, totalTokens: 0,
+      totalCost: 0, totalCostCents: 0, totalCalls: 0, totalTokens: 0,
       topTools: [], topTenants: [], topModels: [],
       timeWindow: null, rangeStart, rangeEnd,
       coverage: 'none',
     };
   }
 
+  const rowCostCents = r => (
+    r && r.cost_cents != null
+      ? normalizeUsdToCents(centsToUsd(r.cost_cents))
+      : normalizeUsdToCents(r && r.cost)
+  );
   const accum = (xs, key) => {
     const m = {};
     for (const r of xs) {
       const k = r[key] || 'unknown';
-      if (!m[k]) m[k] = { name: k, cost: 0, calls: 0, tokens: 0 };
-      m[k].cost   += r.cost  || 0;
+      if (!m[k]) m[k] = { name: k, cost: 0, cost_cents: 0, calls: 0, tokens: 0 };
+      m[k].cost_cents += rowCostCents(r);
       m[k].calls  += r.calls || 0;
       m[k].tokens += r.tok   || 0;
     }
-    return Object.values(m).sort((a, b) => b.cost - a.cost);
+    return Object.values(m)
+      .map(x => ({ ...x, cost: centsToUsd(x.cost_cents) }))
+      .sort((a, b) => b.cost_cents - a.cost_cents);
   };
   const topTools   = accum(inWindow, 'tool_id');
   const topTenants = accum(inWindow, 'tenant_id');
   const topModels  = accum(inWindow, 'model');
-  const totalCost   = inWindow.reduce((s, r) => s + (r.cost  || 0), 0);
+  const totalCostCents = inWindow.reduce((s, r) => s + rowCostCents(r), 0);
+  const totalCost   = centsToUsd(totalCostCents);
   const totalCalls  = inWindow.reduce((s, r) => s + (r.calls || 0), 0);
   const totalTokens = inWindow.reduce((s, r) => s + (r.tok   || 0), 0);
 
@@ -3776,7 +3797,7 @@ function attributeInvoiceWindow(invoiceDate, rows, lookbackDays) {
   }
 
   return {
-    totalCost, totalCalls, totalTokens,
+    totalCost, totalCostCents, totalCalls, totalTokens,
     topTools, topTenants, topModels,
     timeWindow, rangeStart, rangeEnd,
     coverage: 'tracked',
@@ -3793,18 +3814,18 @@ function attributeInvoiceWindow(invoiceDate, rows, lookbackDays) {
 //   attributedTotal NaN/non-finite     → treated as 0
 function computeResidualCoverage(invoiceAmount, attributedTotal, opts) {
   if (invoiceAmount == null) return null;
-  const inv = Number(invoiceAmount);
-  if (!Number.isFinite(inv) || inv === 0) return null;
-  const attRaw = attributedTotal == null ? 0 : Number(attributedTotal);
-  const attSafe = Number.isFinite(attRaw) ? attRaw : 0;
-  const residual_amt = inv - attSafe;
-  const raw_pct = (residual_amt / inv) * 100;
+  const invCents = normalizeUsdToCents(invoiceAmount);
+  if (invCents === 0) return null;
+  const attCents = attributedTotal == null ? 0 : normalizeUsdToCents(attributedTotal);
+  const residual_cents = invCents - attCents;
+  const residual_amt = centsToUsd(residual_cents);
+  const raw_pct = (residual_cents / invCents) * 100;
   const residual_pct = Math.round(raw_pct * 10) / 10;
   const synthetic = !!(opts && opts.synthetic);
-  const warning = (residual_amt > 0 && raw_pct > 5 && !synthetic)
+  const warning = (residual_cents > 0 && raw_pct > 5 && !synthetic)
     ? `RESIDUAL_HIGH:${residual_pct}`
     : null;
-  return { residual_amt, residual_pct, warning };
+  return { residual_amt, residual_cents, residual_pct, warning };
 }
 
 // Pure: synthesize an export shape mimicking the entient-spend Chrome extension
@@ -3818,8 +3839,10 @@ function buildFixtureExport(rows) {
   }
   const byDate = {};
   for (const r of rows) {
-    if (!byDate[r.d]) byDate[r.d] = { cost: 0, tokens: 0 };
-    byDate[r.d].cost   += r.cost || 0;
+    if (!byDate[r.d]) byDate[r.d] = { cost_cents: 0, tokens: 0 };
+    byDate[r.d].cost_cents += r.cost_cents != null
+      ? normalizeUsdToCents(centsToUsd(r.cost_cents))
+      : normalizeUsdToCents(r.cost);
     byDate[r.d].tokens += r.tok  || 0;
   }
   const dates = Object.keys(byDate).sort();
@@ -3829,16 +3852,17 @@ function buildFixtureExport(rows) {
   const seen = new Set();
   while (cursor && !seen.has(cursor) && invoices.length < 6) {
     seen.add(cursor);
-    let windowCost = 0;
+    let windowCostCents = 0;
     for (let di = -2; di <= 0; di++) {
       const d = new Date(new Date(cursor).getTime() + di * 86400000).toISOString().slice(0, 10);
-      if (byDate[d]) windowCost += byDate[d].cost;
+      if (byDate[d]) windowCostCents += byDate[d].cost_cents;
     }
+    const windowCost = centsToUsd(windowCostCents);
     if (windowCost > 0) {
       invoices.push({
         id: `synth-inv-${String(invIdx).padStart(3, '0')}`,
         date: cursor,
-        amount: Number(windowCost.toFixed(2)),
+        amount: windowCost,
         status: 'synthetic',
       });
       invIdx += 1;
@@ -3848,7 +3872,7 @@ function buildFixtureExport(rows) {
     cursor = earlier.length > 0 ? earlier[earlier.length - 1] : null;
   }
   const dailyUsage = dates.slice(-30).map(d => ({
-    date: d, cost: byDate[d].cost, tokens: byDate[d].tokens, model: 'mixed',
+    date: d, cost: centsToUsd(byDate[d].cost_cents), cost_cents: byDate[d].cost_cents, tokens: byDate[d].tokens, model: 'mixed',
   }));
   return { exported_at, synthetic: true, anthropic: { invoices, dailyUsage } };
 }
@@ -3896,11 +3920,13 @@ function reconcile(exportFile, opts) {
   // Group metering rows by date for the gateway summary table at the bottom.
   const meteringByDate = {};
   for (const r of meteringRows) {
-    if (!meteringByDate[r.d]) meteringByDate[r.d] = { cost: 0, tokens: 0, calls: 0, models: {} };
-    meteringByDate[r.d].cost   += r.cost  || 0;
+    if (!meteringByDate[r.d]) meteringByDate[r.d] = { cost: 0, cost_cents: 0, tokens: 0, calls: 0, models: {} };
+    const rowCents = r.cost_cents != null ? normalizeUsdToCents(centsToUsd(r.cost_cents)) : normalizeUsdToCents(r.cost);
+    meteringByDate[r.d].cost_cents += rowCents;
+    meteringByDate[r.d].cost = centsToUsd(meteringByDate[r.d].cost_cents);
     meteringByDate[r.d].tokens += r.tok   || 0;
     meteringByDate[r.d].calls  += r.calls || 0;
-    meteringByDate[r.d].models[r.model] = (meteringByDate[r.d].models[r.model] || 0) + (r.cost || 0);
+    meteringByDate[r.d].models[r.model] = (meteringByDate[r.d].models[r.model] || 0) + rowCents;
   }
   const allMeteringDates = Object.keys(meteringByDate).sort();
 
@@ -3961,7 +3987,8 @@ function reconcile(exportFile, opts) {
       }
       const otherTools = att.topTools.slice(3);
       if (otherTools.length > 0) {
-        const otherCost = otherTools.reduce((s, t) => s + t.cost, 0);
+        const otherCostCents = otherTools.reduce((s, t) => s + (t.cost_cents || normalizeUsdToCents(t.cost)), 0);
+        const otherCost = centsToUsd(otherCostCents);
         const otherTokens = otherTools.reduce((s, t) => s + (t.tokens || 0), 0);
         const label = ('+' + otherTools.length + ' other tools').padEnd(28);
         const otherAmt = isEstimate
@@ -4033,7 +4060,8 @@ function reconcile(exportFile, opts) {
         : dim((m.tokens || 0).toLocaleString().padStart(12) + " tok");
       console.log(`  ${d}   ${cell}   ${dim(m.calls+" calls")}   ${mdlStr}   ${dim(bar)}`);
     }
-    const totalGateway = allMeteringDates.reduce((s, d) => s + meteringByDate[d].cost, 0);
+    const totalGatewayCents = allMeteringDates.reduce((s, d) => s + (meteringByDate[d].cost_cents || 0), 0);
+    const totalGateway = centsToUsd(totalGatewayCents);
     const totalTokens  = allMeteringDates.reduce((s, d) => s + (meteringByDate[d].tokens || 0), 0);
     console.log(`  ${SL}`);
     if (isEstimate) {
@@ -4402,6 +4430,8 @@ if (require.main === module) {
     attributeInvoiceWindow,
     buildFixtureExport,
     computeResidualCoverage,
+    normalizeUsdToCents,
+    centsToUsd,
     fmtEstUsd,
     ADVISORY_ESTIMATE_BANNER,
     parseArgs,

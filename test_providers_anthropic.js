@@ -47,7 +47,7 @@ t("audit.js still exports loadMeteringRows",    typeof audit.loadMeteringRows   
 // The legacy table is preserved inside the plugin as LEGACY_PRICES; the
 // loader-fed table comes from providers/prices.json. They must match
 // row-for-row for the SKUs the legacy code knew about.
-const { priceForModel, calcCost, LEGACY_PRICES, LEGACY_DEFAULT } = ap._internals;
+const { priceForModel, calcCost, normalizeUsdToCents, centsToUsd, LEGACY_PRICES, LEGACY_DEFAULT } = ap._internals;
 
 const pricesJson = JSON.parse(fs.readFileSync(path.join(__dirname, "providers", "prices.json"), "utf8"));
 const jsonByModel = {};
@@ -111,9 +111,14 @@ for (const [model, i, o, cr, cw] of cases) {
   const got = calcCost(model, i, o, cr, cw);
   const exp = legacyCalcCost(model, i, o, cr, cw);
   t(`calcCost parity: ${model}`,
-    got && got.unpriced === false && Math.abs(got.cost - exp) < 1e-12,
+    got && got.unpriced === false && got.cost_cents === normalizeUsdToCents(exp) && got.cost === centsToUsd(got.cost_cents),
     `got=${JSON.stringify(got)} exp=${exp}`);
 }
+
+t("normalizeUsdToCents rounds fractional cents deterministically",
+  normalizeUsdToCents(1.235) === 124);
+t("centsToUsd returns display-safe dollars",
+  centsToUsd(124) === 1.24);
 
 // ── 6. priceForModel match-logic preserved for known SKUs ───────────────────
 t("priceForModel exact match: claude-haiku-3 → 0.25",      priceForModel("claude-haiku-3").in === 0.25);
@@ -139,6 +144,7 @@ t("calcCost empty model: warning labels <empty>",   emptyResult.warning === "unp
 const knownResult = calcCost("claude-haiku-3", 800_000, 50_000, 0, 0);
 t("calcCost known model: cost is finite number",
   knownResult.cost !== null && typeof knownResult.cost === "number" && Number.isFinite(knownResult.cost));
+t("calcCost known model: exposes integer cents", Number.isInteger(knownResult.cost_cents));
 t("calcCost known model: unpriced flag is false",   knownResult.unpriced === false);
 t("calcCost known model: no warning emitted",       knownResult.warning === undefined);
 
@@ -181,7 +187,7 @@ function restoreHttps() { https.request = origRequest; }
 
 const today = new Date().toISOString().slice(0, 10);
 function mkRow() {
-  return { date: today, model: "claude-haiku-3", input_tokens: 1000, output_tokens: 500 };
+  return { date: today, model: "claude-haiku-3", input_tokens: 1_000_000, output_tokens: 200_000 };
 }
 
 (async () => {
@@ -197,6 +203,9 @@ function mkRow() {
   t("no-trunc: ok=true",          aRes.ok === true);
   t("no-trunc: truncated=false",  aRes.truncated === false);
   t("no-trunc: pages_fetched=3",  aRes.pages_fetched === 3);
+  t("no-trunc: totalCostCents sums integer cents", aRes.totalCostCents === 150);
+  t("no-trunc: totalCost renders dollars from cents", aRes.totalCost === 1.50);
+  t("no-trunc: day cost_cents is integer", Number.isInteger(aRes.days[0].cost_cents));
   t("no-trunc: hint=null",        aRes.hint === null);
   t("no-trunc: no pagination_truncated warning",
     Array.isArray(aRes.warnings) && aRes.warnings.every(w => !w.startsWith("pagination_truncated")));
@@ -220,6 +229,25 @@ function mkRow() {
     typeof bRes.hint === "string" && bRes.hint.startsWith("Usage results hit the pagination safety cap"));
   t("cap-hit: warnings includes pagination_truncated entry",
     Array.isArray(bRes.warnings) && bRes.warnings.some(w => w.startsWith("pagination_truncated:max_pages=100")));
+
+  // ── Case C: Admin cost_report sums cents, not floats ───────────────────────
+  mockHttps([
+    {
+      rows: [
+        { starting_at: today + "T00:00:00Z", amount: { value: "0.10" } },
+        { starting_at: today + "T01:00:00Z", amount: { value: "0.20" } },
+        { starting_at: today + "T02:00:00Z", amount: { value: "0.335" } },
+      ],
+      next_page: null,
+    },
+  ]);
+  const cRes = await ap.fetchCostReport("sk-ant-admin-test", 7);
+  restoreHttps();
+
+  t("cost-report: ok=true", cRes.ok === true);
+  t("cost-report: totalCostCents rounded sum", cRes.totalCostCents === 64);
+  t("cost-report: totalCost display dollars", cRes.totalCost === 0.64);
+  t("cost-report: byDay carries integer cents", cRes.byDay[0].cost_cents === 64);
 
   // ── Summary ───────────────────────────────────────────────────────────────
   console.log(`\n  ${pass} pass, ${fail} fail`);
