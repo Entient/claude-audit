@@ -4,10 +4,17 @@
 
 "use strict";
 
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
 const {
   attributeInvoiceWindow,
   buildFixtureExport,
   computeResidualCoverage,
+  loadMeteringRows,
+  normalizeUsdToCents,
+  centsToUsd,
 } = require("./audit.js");
 
 let pass = 0, fail = 0;
@@ -24,6 +31,31 @@ const sampleRows = [
   { d: '2026-04-23', h: '10', model: 'claude-sonnet-4-6', tool_id: 'entient_certify_session', tenant_id: 'default',       request_category: 'mcp_tool',  tok: 200000, cost: 2.00, calls: 40,  first_t: '10:00', last_t: '10:30' },
   { d: '2026-04-25', h: '08', model: 'claude-sonnet-4-6', tool_id: 'entient_intercept',       tenant_id: 'default',       request_category: 'mcp_tool',  tok: 300000, cost: 3.00, calls: 60,  first_t: '08:05', last_t: '08:50' },
 ];
+
+// SHIP_CHECKLIST 7.6: cent-normalized rows in the shape loadMeteringRows()
+// now emits. Dollar fields remain for display compatibility only.
+const centRows = [
+  { d: '2026-04-22', h: '09', model: 'claude-sonnet-4-6', tool_id: 'a', tenant_id: 'default', request_category: 'mcp_tool', tok: 1, cost: 0.10, cost_cents: 10, calls: 1, first_t: '09:00', last_t: '09:01' },
+  { d: '2026-04-22', h: '10', model: 'claude-sonnet-4-6', tool_id: 'a', tenant_id: 'default', request_category: 'mcp_tool', tok: 1, cost: 0.20, cost_cents: 20, calls: 1, first_t: '10:00', last_t: '10:01' },
+  { d: '2026-04-22', h: '11', model: 'claude-sonnet-4-6', tool_id: 'b', tenant_id: 'default', request_category: 'mcp_tool', tok: 1, cost: 0.335, cost_cents: 34, calls: 1, first_t: '11:00', last_t: '11:01' },
+];
+
+// ── cent helpers: deterministic normalization/display ───────────────────────
+{
+  t("normalize 0.335 dollars -> 34 cents",    normalizeUsdToCents(0.335) === 34);
+  t("normalize string dollars -> cents",      normalizeUsdToCents("12.345") === 1235);
+  t("centsToUsd 1235 -> 12.35",               centsToUsd(1235) === 12.35);
+}
+
+// ── attributeInvoiceWindow: cent fields drive sums, avoiding drift ───────────
+{
+  const att = attributeInvoiceWindow('2026-04-22', centRows, 0);
+  const toolA = att.topTools.find(x => x.name === 'a');
+  t("cent rows totalCostCents = 64",           att.totalCostCents === 64);
+  t("cent rows totalCost = 0.64",              att.totalCost === 0.64);
+  t("0.10 + 0.20 cents sum has no float drift", toolA.cost === 0.30);
+  t("topTools preserve integer cost_cents",    toolA.cost_cents === 30);
+}
 
 // ── attributeInvoiceWindow: 3-day window picks up two days ───────────────────
 {
@@ -160,6 +192,15 @@ const sampleRows = [
   t("residual 5.1%: warning = RESIDUAL_HIGH:5.1", r.warning === "RESIDUAL_HIGH:5.1");
 }
 
+// Reconcile comparison uses cents, so 0.1 + 0.2 cannot create a false residual.
+{
+  const att = attributeInvoiceWindow('2026-04-22', centRows.slice(0, 2), 0);
+  const r = computeResidualCoverage(0.30, att.totalCost);
+  t("cent residual compare: 0.30 - (0.10+0.20) = 0 cents", r.residual_cents === 0);
+  t("cent residual compare: no warning",       r.warning === null);
+  t("display still renders dollars with toFixed at boundary", `$${att.totalCost.toFixed(2)}` === "$0.30");
+}
+
 // 50% residual: warning fires with integer-display pct (no trailing .0).
 {
   const r = computeResidualCoverage(100, 50);
@@ -212,6 +253,35 @@ const sampleRows = [
 }
 
 // ── Summary ──────────────────────────────────────────────────────────────────
+// loadMeteringRows normalizes cost_usd at the SQLite read boundary.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "entient-spend-metering-"));
+  const dbPath = path.join(dir, "metering.db");
+  const py = `
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("""CREATE TABLE usage (
+  timestamp_utc TEXT, model TEXT, tool_id TEXT, tenant_id TEXT,
+  request_category TEXT, total_tokens INTEGER, cost_usd REAL, cached INTEGER
+)""")
+rows = [
+  ("2026-04-22T09:00:00Z", "claude-haiku-3", "tool", "tenant", "mcp_tool", 1, 0.10, 0),
+  ("2026-04-22T09:01:00Z", "claude-haiku-3", "tool", "tenant", "mcp_tool", 1, 0.20, 0),
+  ("2026-04-22T09:02:00Z", "claude-haiku-3", "tool", "tenant", "mcp_tool", 1, 0.335, 0),
+]
+conn.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?)", rows)
+conn.commit()
+`;
+  const created = spawnSync("python", ["-c", py, dbPath], { encoding: "utf8" });
+  const rows = created.status === 0 ? loadMeteringRows(dbPath) : [];
+  t("loadMeteringRows fixture created", created.status === 0, created.stderr);
+  t("loadMeteringRows emits one aggregate row", rows.length === 1);
+  t("loadMeteringRows sums rounded integer cents", rows[0] && rows[0].cost_cents === 64);
+  t("loadMeteringRows dollar field derives from cents", rows[0] && rows[0].cost === 0.64);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// Summary
 console.log("");
 if (fail > 0) {
   console.log(`FAILED  ${fail} of ${pass + fail}`);

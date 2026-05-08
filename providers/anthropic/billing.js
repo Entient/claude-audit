@@ -55,6 +55,18 @@ const LEGACY_DEFAULT = { in: 3, out: 15 };  // Dormant — not consulted by pric
 // narrower --last window. Warn-and-continue, not hard-error.
 const MAX_USAGE_PAGES = 100;
 
+function normalizeUsdToCents(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100);
+}
+
+function centsToUsd(cents) {
+  const n = Number(cents);
+  if (!Number.isFinite(n)) return 0;
+  return n / 100;
+}
+
 function _loadPriceTable() {
   if (_PRICES !== null) return;
   try {
@@ -83,8 +95,8 @@ function priceForModel(modelId) {
   return null;  // Unknown model — no silent fallback. See header comment.
 }
 
-// Returns { cost, unpriced, model, warning? }.
-//   Known model:   { cost: number, unpriced: false, model }
+// Returns { cost, cost_cents, unpriced, model, warning? }.
+//   Known model:   { cost: number, cost_cents: integer, unpriced: false, model }
 //   Unknown model: { cost: null,   unpriced: true,  model, warning: "unpriced_model:<id>" }
 // Callers must check `unpriced` and exclude from totals when true.
 function calcCost(model, inputTok, outputTok, cacheReadTok, cacheWriteTok) {
@@ -102,7 +114,8 @@ function calcCost(model, inputTok, outputTok, cacheReadTok, cacheWriteTok) {
   const out  = (outputTok     || 0) / 1_000_000 * p.out;
   const cr   = (cacheReadTok  || 0) / 1_000_000 * (p.in * 0.1);
   const cw   = (cacheWriteTok || 0) / 1_000_000 * (p.in * 1.25);
-  return { cost: inp + out + cr + cw, unpriced: false, model: modelLabel };
+  const cost_cents = normalizeUsdToCents(inp + out + cr + cw);
+  return { cost: centsToUsd(cost_cents), cost_cents, unpriced: false, model: modelLabel };
 }
 
 // ── /v1/usage ───────────────────────────────────────────────────────────────
@@ -164,14 +177,14 @@ async function fetchUsage(apiKey, days = 30) {
     }
 
     const byDay = {};
-    let totalCost = 0;
+    let totalCostCents = 0;
     const unpricedSet = new Set();
 
     for (const row of allRows) {
       const date = (row.date || row.timestamp || "").slice(0, 10);
       if (!date || date < startDate) continue;
 
-      if (!byDay[date]) byDay[date] = { date, inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, cost: 0, models: {} };
+      if (!byDay[date]) byDay[date] = { date, inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cost_cents: 0, models: {} };
 
       const inp = row.input_tokens || row.input || 0;
       const out = row.output_tokens || row.output || 0;
@@ -195,12 +208,15 @@ async function fetchUsage(apiKey, days = 30) {
         byDay[date].models[model].unpriced = true;
         continue;
       }
-      byDay[date].cost += result.cost;
-      totalCost        += result.cost;
+      const rowCents = result.cost_cents || normalizeUsdToCents(result.cost);
+      byDay[date].cost_cents = (byDay[date].cost_cents || 0) + rowCents;
+      byDay[date].cost = centsToUsd(byDay[date].cost_cents);
+      totalCostCents += rowCents;
 
       if (!byDay[date].models[model]) byDay[date].models[model] = { tokens: 0, cost: 0 };
       byDay[date].models[model].tokens += inp + out;
-      byDay[date].models[model].cost   += result.cost;
+      byDay[date].models[model].cost_cents = (byDay[date].models[model].cost_cents || 0) + rowCents;
+      byDay[date].models[model].cost = centsToUsd(byDay[date].models[model].cost_cents);
     }
 
     const days_arr = Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date));
@@ -213,7 +229,8 @@ async function fetchUsage(apiKey, days = 30) {
     return {
       ok: true,
       days: days_arr,
-      totalCost,
+      totalCost: centsToUsd(totalCostCents),
+      totalCostCents,
       rowCount: allRows.length,
       unpricedModels,
       warnings,
@@ -314,18 +331,29 @@ async function fetchCostReport(adminKey, days = 30) {
 
     const rows = data.data || [];
     const byDay = {};
-    let totalCost = 0;
+    let totalCostCents = 0;
     for (const row of rows) {
       const date = (row.starting_at || row.date || "").slice(0, 10);
       if (!date || date < startDate) continue;
-      const cost = parseFloat(row.amount?.value || row.cost || 0);
-      byDay[date] = (byDay[date] || 0) + cost;
-      totalCost += cost;
+      const costCents = normalizeUsdToCents(row.amount?.value ?? row.cost ?? 0);
+      byDay[date] = (byDay[date] || 0) + costCents;
+      totalCostCents += costCents;
     }
-    const byDayArr = Object.entries(byDay).map(([date, cost]) => ({ date, cost }))
+    const byDayArr = Object.entries(byDay).map(([date, costCents]) => ({
+      date,
+      cost: centsToUsd(costCents),
+      cost_cents: costCents,
+    }))
       .sort((a, b) => a.date.localeCompare(b.date));
 
-    return { ok: true, totalCost, byDay: byDayArr, rowCount: rows.length, source: "admin_api" };
+    return {
+      ok: true,
+      totalCost: centsToUsd(totalCostCents),
+      totalCostCents,
+      byDay: byDayArr,
+      rowCount: rows.length,
+      source: "admin_api",
+    };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -337,5 +365,5 @@ module.exports = {
   fetchCostReport,
   countTokens,
   // Internals exposed for parity tests only — not part of the provider contract.
-  _internals: { priceForModel, calcCost, LEGACY_PRICES, LEGACY_DEFAULT, MAX_USAGE_PAGES },
+  _internals: { priceForModel, calcCost, normalizeUsdToCents, centsToUsd, LEGACY_PRICES, LEGACY_DEFAULT, MAX_USAGE_PAGES },
 };
